@@ -1,4 +1,4 @@
-from tg.handlers.commands import Command
+from telegram.handlers.commands import Command
 from telethon import TelegramClient
 from telethon.tl.custom.message import Message
 

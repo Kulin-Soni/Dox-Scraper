@@ -1,4 +1,4 @@
-from tg.bot import client
+from telegram.bot import client
 from telethon import TelegramClient, events
 # from telethon.events import Album
 from telethon.tl.custom.message import Message
@@ -25,5 +25,5 @@ def loadCommands(mainDir: Path):
     path = Path(mainDir).resolve() / "commands" # initialized from main.py file
     cmds = list(filter(lambda x: x.name != "__init__.py" and (not x.name.startswith("h_")) and x.suffix == ".py" and x.is_file(), path.glob("*.py")))
     for cmd in cmds:
-        import_module(f"tg.commands.{cmd.stem}")
+        import_module(f"telegram.commands.{cmd.stem}")
     print("=> Commands initialized on Telegram")

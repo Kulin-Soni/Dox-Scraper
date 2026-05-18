@@ -1,205 +1,232 @@
 import asyncio
-import subprocess
-from pathlib import Path
+import shutil
 import typing
-import http.server
-import threading
+from os import remove
+from pathlib import Path
+from urllib.parse import quote
+
 import aiofiles
 import aiohttp
 from aiohttp.typedefs import LooseHeaders
-from camoufox.async_api import BrowserContext # type: ignore
-from urllib.parse import urlparse, parse_qs, quote
+from camoufox.async_api import BrowserContext  # type: ignore
 from tqdm import trange
 from tqdm.asyncio import tqdm
-from os import remove
-
 from scraper.config import PROVIDER_ORIGIN
 
 
-class PortHandler(http.server.BaseHTTPRequestHandler):
-    def _HTML(self, url: str):
-        return f"""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Player</title>
-                </head>
-                <body style="width: 100dvw; height: 100dvh;">
-                    <iframe src="{url}" width="100%" height="100%" frameborder="0" scrolling="no" allowfullscreen muted></iframe>
-                </body>
-                </html>
-        """.encode()
+_EMPTY_METADATA: typing.Dict[str, typing.Any] = {
+    "video": "",
+    "subtitles": [],
+    "dir": "",
+}
 
-    def do_GET(self):
-        params = parse_qs(urlparse(self.path).query)
-        target = params.get("url", [""])[0]
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write(self._HTML(target))
+_DOWNLOAD_HEADERS: LooseHeaders = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Origin": PROVIDER_ORIGIN,
+    "Sec-GPC": "1",
+    "Connection": "keep-alive",
+    "Referer": PROVIDER_ORIGIN,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+}
 
-    def log_message(self, *args):
-        pass  # silence logs
+# Maximum concurrent chunk download requests
+_MAX_CONCURRENT_DOWNLOADS = 75
 
-
-class Server:
-    server: http.server.HTTPServer
-
-    def __init__(self) -> None:
-        pass
-
-    def launch(self):
-        self.server = http.server.HTTPServer(("localhost", 8280), PortHandler)
-        self.server.handle_error = lambda *_: None  # type: ignore # suppress BrokenPipeError
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def stop(self):
-        self.server.shutdown()
-
-
-DEFAULT_METADATA = {"video": "", "subtitles": []}
-DEFAULT_FILE_DIR = None
+# ---------------------------------------------------------------------------
+# Media scraper
+# ---------------------------------------------------------------------------
 
 class Scraper:
-    media_urls: typing.List[str]
-    current_file_dir: Path | None
+    """
+    Intercepts HLS (.m3u8) streams and subtitle (.vtt) files loaded by a
+    browser page, downloads all TS chunks in parallel, and merges them into
+    a single .ts file on disk.
+    """
 
     def __init__(self) -> None:
-        self.media_urls = []
-        self.current_file_name = ""
-        self.current_file_dir = DEFAULT_FILE_DIR
-        self.metadata = DEFAULT_METADATA
-        self.media_found = False
+        self._chunk_urls: typing.List[str] = []
+        self._current_title: str = ""
+        self._output_dir: Path | None = None
+        self._metadata: typing.Dict[str, typing.Any] = dict(_EMPTY_METADATA)
+        self._media_found: bool = False
 
-    async def _load_m3u8_playlist(self, response):
+    # ------------------------------------------------------------------
+    # Browser response interception
+    # ------------------------------------------------------------------
+
+    async def _on_browser_response(self, response) -> None:
+        """Called for every network response captured by Camoufox."""
+        await self._handle_m3u8_or_vtt(response)
+
+    async def _handle_m3u8_or_vtt(self, response) -> None:
+        """
+        Parse HLS playlist responses to collect TS chunk URLs,
+        or save subtitle (VTT) responses to disk.
+        """
         url = str(response.url)
+
         if url.endswith(".m3u8"):
-            content = str(await response.text())
+            content = await response.text()
+            # Only process media playlists (those containing actual segments)
             if "#EXTINF" in content:
                 for line in content.splitlines():
                     if "https://" in line:
-                        self.media_urls.append(line)
+                        self._chunk_urls.append(line)
+
         elif url.endswith(".vtt"):
-            content = str(await response.text())
-            sub_file_name = url.split("/")[-1]
-            await self._handle_subtitles(content, sub_file_name)
+            content = await response.text()
+            subtitle_filename = url.split("/")[-1]
+            await self._save_subtitle(content, subtitle_filename)
 
-    def _resolve_dir(self):
-        self.current_file_dir = Path("./temp") / self.current_file_name
-        self.current_file_dir.mkdir(exist_ok=True, parents=True)
+    # ------------------------------------------------------------------
+    # Subtitle handling
+    # ------------------------------------------------------------------
 
-    async def _handle_subtitles(self, content: str, file_name: str):
-        self._resolve_dir()
-        subtitles_file = (
-            self.current_file_dir / f"{self.current_file_name}_{file_name}.vtt"
-        )
-        async with aiofiles.open(subtitles_file.resolve(), "a") as f:
+    def _ensure_output_dir(self) -> None:
+        """Create the per-title temp directory if it doesn't exist yet."""
+        if self._output_dir is None:
+            self._output_dir = Path("./temp") / self._current_title
+            self._output_dir.mkdir(exist_ok=True, parents=True)
+
+    async def _save_subtitle(self, content: str, filename: str) -> None:
+        """Append subtitle content to a VTT file inside the output directory."""
+        self._ensure_output_dir()
+        subtitle_path = self._output_dir / f"{self._current_title}_{filename}.vtt"
+
+        self._metadata["dir"] = self._output_dir
+
+        async with aiofiles.open(subtitle_path.resolve(), "a") as f:
             await f.write(content)
 
-        self.metadata["subtitles"].append(Path(subtitles_file).as_posix())
+        self._metadata["subtitles"].append(subtitle_path.as_posix())
 
-    async def _fetch_urls_and_write(self, session: aiohttp.ClientSession):
-        headers: LooseHeaders = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "Origin": PROVIDER_ORIGIN,
-            "Sec-GPC": "1",
-            "Connection": "keep-alive",
-            "Referer": PROVIDER_ORIGIN,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "cross-site",
-        }
+    # ------------------------------------------------------------------
+    # Chunk download and merge
+    # ------------------------------------------------------------------
 
-        urls = self.media_urls
-        if len(urls) > 0:
-            self._resolve_dir()
-            self.media_found = True
-        else:
+    async def _download_and_merge_chunks(self, session: aiohttp.ClientSession) -> None:
+        """
+        Download all collected TS chunk URLs concurrently, write each to a
+        numbered temp file, then concatenate them in order into a single .ts file.
+        """
+        if not self._chunk_urls:
             return
-        
-        file_path = self.current_file_dir / f"{self.current_file_name}.ts"
-        sem = asyncio.Semaphore(75)
 
-        async def temp_fetch_and_write(url: str, multiplier: int, bar: tqdm):
+        self._ensure_output_dir()
+        self._media_found = True
+
+        output_path = self._output_dir / f"{self._current_title}.ts"
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+
+        async def download_chunk(url: str, index: int, progress: tqdm) -> None:
+            temp_path = self._output_dir / f"temp_{index}.ts"
             try:
-                async with (
-                    aiofiles.open(
-                        (self.current_file_dir / f"temp_{multiplier}.ts"), "w+b"
-                    ) as file,
-                    sem,
-                ):
-                    response = await session.get(url, headers=headers)
+                async with semaphore, aiofiles.open(temp_path, "w+b") as f:
+                    response = await session.get(url, headers=_DOWNLOAD_HEADERS)
                     data = await response.read()
-                    await file.write(data)
-                    await file.flush()
-                    await file.close()
-
+                    await f.write(data)
+                    await f.flush()
             except Exception as e:
-                print(e)
+                print(f"[chunk {index}] Download error: {e}")
+            finally:
+                progress.update(1)
 
-            bar.update(1)
-
-        with tqdm(total=len(urls), unit="chunks", desc="=> Downloading ") as bar:
+        # Download all chunks concurrently
+        with tqdm(
+            total=len(self._chunk_urls), unit="chunks", desc="=> Downloading "
+        ) as bar:
             await asyncio.gather(
                 *(
-                    asyncio.create_task(temp_fetch_and_write(url, i, bar))
-                    for i, url in enumerate(urls)
+                    asyncio.create_task(download_chunk(url, i, bar))
+                    for i, url in enumerate(self._chunk_urls)
                 )
             )
 
-        with open(file_path, "ab") as file:
-            for i in trange(len(urls), desc="=> Merging ", unit="file"):
-                temp_file_path = (self.current_file_dir / f"temp_{i}.ts")
-                with open(
-                    temp_file_path.resolve(), "rb"
-                ) as temp:
-                    data = temp.read()
-                    file.write(data)
-        # print("=> Merging files")
-        # temp_files = [(self.current_file_dir / f"temp_{i}.ts").as_posix() for i in range(len(urls))]
-        # with open(file_path, "wb") as out:
-        #     subprocess.run(["cat", *temp_files], stdout=out, check=True)
+        # Merge temp files in order into the final .ts file
+        with open(output_path, "ab") as merged:
+            for i in trange(len(self._chunk_urls), desc="=> Merging ", unit="file"):
+                temp_path = self._output_dir / f"temp_{i}.ts"
+                with open(temp_path.resolve(), "rb") as temp:
+                    merged.write(temp.read())
+                merged.flush()
 
-        self.metadata["video"] = file_path.as_posix()
+        self._metadata["video"] = output_path.as_posix()
 
-    async def _cleanup(self):
-        if self.media_found and self.current_file_dir:
-            for i in range(len(self.media_urls)):
-                remove(self.current_file_dir / f"temp_{i}.ts")
-        self.media_urls.clear()
-        self.media_found = False
-        self.current_file_dir = DEFAULT_FILE_DIR
-        self.metadata = DEFAULT_METADATA
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
 
-    async def _request_interception(self, response):
-        await self._load_m3u8_playlist(response)
+    async def _cleanup(self) -> None:
+        """Remove per-chunk temp files and reset scraper state for the next run."""
+        if self._media_found and self._output_dir:
+            for i in range(len(self._chunk_urls)):
+                temp_path = self._output_dir / f"temp_{i}.ts"
+                remove(temp_path)
 
-    async def scrape(self, url: dict, ctx: BrowserContext, client_session: aiohttp.ClientSession):
+        self._chunk_urls.clear()
+        self._media_found = False
+        self._output_dir = None
+        self._metadata = dict(_EMPTY_METADATA)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    async def scrape(
+        self,
+        target: dict,
+        browser_ctx: BrowserContext,
+        http_session: aiohttp.ClientSession,
+    ) -> dict | None:
+        """
+        Open `target["url"]` inside the proxy server via Camoufox, wait for
+        HLS stream responses, download all chunks, and return metadata:
+
+            {
+                "video":     "<path to merged .ts file>",
+                "subtitles": ["<path to .vtt>", ...],
+                "dir":       "<output directory>",
+            }
+
+        Returns None if no media was found or an error occurred.
+        """
+        metadata = dict(_EMPTY_METADATA)
         try:
-            self.current_file_name = url["name"]
-            page = await ctx.new_page()
-            page.on("response", self._request_interception)
+            self._current_title = target["name"]
 
-            await page.goto(f"http://localhost:8280?url={quote(url["url"])}")
+            page = await browser_ctx.new_page()
+            page.on("response", self._on_browser_response)
+
+            proxied_url = f"http://localhost:8280?url={quote(target['url'])}"
+            await page.goto(proxied_url)
             await page.wait_for_load_state("domcontentloaded")
+
+            # Give the player a moment to trigger playlist requests
             await asyncio.sleep(5)
             await page.close()
 
-            await self._fetch_urls_and_write(client_session)
+            await self._download_and_merge_chunks(http_session)
 
-            metadata = self.metadata
-            found = self.media_found
+            metadata = self._metadata
+            found = self._media_found
 
             await self._cleanup()
 
             if found:
                 return metadata
+
+            # No video found; clean up any subtitle-only directory
+            if metadata["dir"]:
+                shutil.rmtree(metadata["dir"])
             return None
+
         except Exception as e:
-            print(e)
+            print(f"[scrape] Error for '{target.get('name')}': {e}")
+            if metadata["dir"]:
+                shutil.rmtree(metadata["dir"])
             return None

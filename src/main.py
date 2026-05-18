@@ -1,6 +1,6 @@
-from handlers.process import app_ctx
-from jobs.bot import launch_bot_job
-from jobs.scrape import launch_scrape_job
+from core.handlers.process import app_ctx
+from core.jobs.bot import launch_bot_job
+from core.jobs.scrape import launch_scrape_job
 
 def main():
     app_ctx.register("p1", launch_bot_job)

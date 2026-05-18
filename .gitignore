@@ -5,3 +5,5 @@ test.py
 temp
 **/__pycache__
 dox.session
+record.json
+test
