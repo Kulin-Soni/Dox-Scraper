@@ -11,7 +11,7 @@ def Command(name: str, allowed: list[int] | None = None):
     def decorator(func: FunctionType) -> FunctionType:
         @client.on(events.NewMessage(pattern=rf"/{name}(?:\s+(.+))?"))
         async def run(event: Message):
-            if allowed is not None and len(allowed) > 0:
+            if allowed is not None and len(allowed):
                 if event.sender_id in allowed:
                     await func(event, client)
                 else:

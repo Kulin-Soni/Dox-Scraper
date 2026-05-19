@@ -8,7 +8,7 @@ from camoufox import AsyncCamoufox
 from .anilist import AnilistGenerator
 from .converter import convert
 from .progress import ProgressTracker
-from .scraper import Scraper
+from .hls import HLSScraper
 from .proxy import ProxyServer
 from .providers.megabuzz import URLBuilder
 from core.handlers.process import app_ctx
@@ -74,7 +74,7 @@ async def scrape_job() -> None:
     tracker = ProgressTracker(RECORD_FILE)
     page, anime_list, origin = await _load_or_generate_anime_list(tracker)
 
-    scraper = Scraper(
+    scraper = HLSScraper(
         _download_headers(origin)
     )
     server = ProxyServer()
@@ -89,7 +89,7 @@ async def scrape_job() -> None:
             metadata = await scraper.scrape(anime, ctx, session)
 
             if metadata:
-                print("=> Converting to MKV")
+                print("=> Merging & converting to MKV")
                 metadata = await convert(metadata)
 
                 print("=> Attempting data transfer to Telegram")

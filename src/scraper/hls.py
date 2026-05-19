@@ -15,6 +15,7 @@ from tqdm.asyncio import tqdm
 # Default metadata value
 _EMPTY_METADATA: typing.Dict[str, typing.Any] = {
     "video": "",
+    "parts": 0,
     "subtitles": [],
     "dir": "",
 }
@@ -26,7 +27,7 @@ _MAX_CONCURRENT_DOWNLOADS = 75
 # Media scraper
 # ---------------------------------------------------------------------------
 
-class Scraper:
+class HLSScraper:
     """
     Intercepts HLS (.m3u8) streams and subtitle (.vtt) files loaded by a
     browser page, downloads all TS chunks in parallel, and merges them into
@@ -66,7 +67,7 @@ class Scraper:
 
         elif url.endswith(".vtt"):
             content = await response.text()
-            subtitle_filename = url.split("/")[-1]
+            subtitle_filename = '_'.join(url.rsplit("/", maxsplit=1)[-1].split(".")[:-1])+'.vtt'
             await self._save_subtitle(content, subtitle_filename)
 
     # ------------------------------------------------------------------
@@ -106,14 +107,13 @@ class Scraper:
         self._ensure_output_dir()
         self._media_found = True
 
-        output_path = self._output_dir / f"{self._current_title}.ts"
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
 
         async def download_chunk(url: str, index: int, progress: tqdm) -> None:
             temp_path = self._output_dir / f"temp_{index}.ts"
             try:
                 async with semaphore, aiofiles.open(temp_path, "w+b") as f:
-                    response = await session.get(url, headers=_DOWNLOAD_HEADERS)
+                    response = await session.get(url, headers=self._headers)
                     data = await response.read()
                     await f.write(data)
                     await f.flush()
@@ -134,14 +134,19 @@ class Scraper:
             )
 
         # Merge temp files in order into the final .ts file
-        with open(output_path, "ab") as merged:
-            for i in trange(len(self._chunk_urls), desc="=> Merging ", unit="file"):
-                temp_path = self._output_dir / f"temp_{i}.ts"
-                with open(temp_path.resolve(), "rb") as temp:
-                    merged.write(temp.read())
-                merged.flush()
+        # with open(output_path, "ab") as merged:
+        #     for i in trange(len(self._chunk_urls), desc="=> Merging ", unit="file"):
+        #         temp_path = self._output_dir / f"temp_{i}.ts"
+        #         with open(temp_path.resolve(), "rb") as temp:
+        #             merged.write(temp.read())
+        #         merged.flush()
+        # Merging with FFMPEG in the conversion to reduce steps
 
+        # The file we expect after conversion and merging
+
+        output_path = self._output_dir / f"{self._current_title}.mkv"
         self._metadata["video"] = output_path.as_posix()
+        self._metadata["parts"] = len(self._chunk_urls)
 
     # ------------------------------------------------------------------
     # Cleanup
