@@ -11,27 +11,12 @@ from aiohttp.typedefs import LooseHeaders
 from camoufox.async_api import BrowserContext  # type: ignore
 from tqdm import trange
 from tqdm.asyncio import tqdm
-from scraper.config import PROVIDER_ORIGIN
 
-
+# Default metadata value
 _EMPTY_METADATA: typing.Dict[str, typing.Any] = {
     "video": "",
     "subtitles": [],
     "dir": "",
-}
-
-_DOWNLOAD_HEADERS: LooseHeaders = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Origin": PROVIDER_ORIGIN,
-    "Sec-GPC": "1",
-    "Connection": "keep-alive",
-    "Referer": PROVIDER_ORIGIN,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site",
 }
 
 # Maximum concurrent chunk download requests
@@ -48,12 +33,13 @@ class Scraper:
     a single .ts file on disk.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, headers: LooseHeaders) -> None:
         self._chunk_urls: typing.List[str] = []
         self._current_title: str = ""
         self._output_dir: Path | None = None
         self._metadata: typing.Dict[str, typing.Any] = dict(_EMPTY_METADATA)
         self._media_found: bool = False
+        self._headers = headers
 
     # ------------------------------------------------------------------
     # Browser response interception

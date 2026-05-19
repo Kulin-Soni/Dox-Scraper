@@ -2,6 +2,7 @@ import shutil
 from pathlib import Path
 
 import aiohttp
+from aiohttp.typedefs import LooseHeaders
 from camoufox import AsyncCamoufox
 
 from .anilist import AnilistGenerator
@@ -9,6 +10,7 @@ from .converter import convert
 from .progress import ProgressTracker
 from .scraper import Scraper
 from .proxy import ProxyServer
+from .providers.megabuzz import URLBuilder
 from core.handlers.process import app_ctx
 
 TEMP_DIR = Path("./temp")
@@ -23,13 +25,15 @@ def _clear_temp() -> None:
         pass
 
 
-async def _load_or_generate_anime_list(tracker: ProgressTracker) -> tuple[int, list]:
+async def _load_or_generate_anime_list(tracker: ProgressTracker) -> tuple[int, list, str]:
     """Returns saved progress if available, otherwise generates a fresh anime list."""
     page, items = tracker.load()
     if items:
-        return page, items
+        origin = URLBuilder().origin()
+        return page, items, origin
     anime_list = await AnilistGenerator(page, 1).generate()
-    return page, anime_list
+    anime_list, origin = URLBuilder(anime_list=anime_list).build()
+    return page, anime_list, origin
 
 
 def _upload_to_telegram(metadata: dict) -> bool:
@@ -37,6 +41,27 @@ def _upload_to_telegram(metadata: dict) -> bool:
     app_ctx.data_q.put(metadata)
     response = app_ctx.ok_q.get()
     return response.get("job") == "upload" and response.get("status") == "done"
+
+def _download_headers(provider_origin: str) -> LooseHeaders:
+    """
+    Build HTTP request headers for downloading from a streaming provider.
+
+    ``Origin`` and ``Referer`` are set dynamically so the same function works
+    across different provider origins without duplicating header blocks.
+    """
+    return {
+        "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Origin":          provider_origin,
+        "Referer":         provider_origin,
+        "Connection":      "keep-alive",
+        "Sec-GPC":         "1",
+        "Sec-Fetch-Dest":  "empty",
+        "Sec-Fetch-Mode":  "cors",
+        "Sec-Fetch-Site":  "cross-site",
+    }
 
 
 async def scrape_job() -> None:
@@ -47,9 +72,11 @@ async def scrape_job() -> None:
     _clear_temp()
 
     tracker = ProgressTracker(RECORD_FILE)
-    page, anime_list = await _load_or_generate_anime_list(tracker)
+    page, anime_list, origin = await _load_or_generate_anime_list(tracker)
 
-    scraper = Scraper()
+    scraper = Scraper(
+        _download_headers(origin)
+    )
     server = ProxyServer()
     server.launch()
 

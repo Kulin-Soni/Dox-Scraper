@@ -1,6 +1,6 @@
 import aiohttp
-from pathvalidate import sanitize_filename
-from .config import PROVIDER
+from typing import List
+
 
 # GraphQL query to fetch popular anime with episode counts from AniList
 ANILIST_QUERY = """
@@ -16,7 +16,6 @@ ANILIST_QUERY = """
 """
 
 ANILIST_API_URL = "https://graphql.anilist.co"
-CONTENT_TYPES = ["sub", "dub"]
 
 
 class AnilistGenerator:
@@ -26,7 +25,7 @@ class AnilistGenerator:
         self.page = page
         self.units = units
 
-    async def generate(self) -> list[dict]:
+    async def generate(self) -> List[dict]:
         """
         Fetches anime from AniList and returns a flat list of episode entries,
         each with a sanitized name and provider URL for both sub and dub.
@@ -44,21 +43,7 @@ class AnilistGenerator:
                 data = await response.json()
                 anime_list = data["data"]["Page"]["media"]
 
-                return [
-                    self._build_episode_entry(anime, episode, content_type)
-                    for anime in anime_list
-                    if anime["episodes"]
-                    for episode in range(1, int(anime["episodes"]) + 1)
-                    for content_type in CONTENT_TYPES
-                ]
+                return anime_list
 
             except Exception:
                 return []
-
-    def _build_episode_entry(self, anime: dict, episode: int, content_type: str) -> dict:
-        """Constructs a single episode entry with a sanitized name and provider URL."""
-        anime_id = anime["id"]
-        sanitized_title = sanitize_filename(anime["title"]["english"]).replace(" ", "_")
-        name = f"{anime_id}_{sanitized_title}_episode_{episode}_{content_type}"
-        url = f"{PROVIDER}/ani/{anime_id}/{episode}/{content_type}"
-        return {"name": name, "url": url}
