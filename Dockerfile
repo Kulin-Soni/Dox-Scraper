@@ -24,6 +24,9 @@ RUN adduser \
     --uid "${UID}" \
     appuser
 
+# Install FFMPEG
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 # Download dependencies as a separate step to take advantage of Docker's caching.
 # Leverage a cache mount to /root/.cache/pip to speed up subsequent builds.
 # Leverage a bind mount to requirements.txt to avoid having to copy them into
@@ -32,6 +35,7 @@ RUN adduser \
 #     --mount=type=bind,source=requirements.txt,target=requirements.txt \
 #     python -m pip install -r requirements.txt
 RUN pip install uv
+RUN uv run camoufox fetch
 RUN uv sync
 
 

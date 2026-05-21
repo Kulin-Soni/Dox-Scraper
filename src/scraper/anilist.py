@@ -1,15 +1,36 @@
 import aiohttp
-from typing import List
 
 
 # GraphQL query to fetch popular anime with episode counts from AniList
 ANILIST_QUERY = """
     query ($page: Int, $perPage: Int) {
         Page(page: $page, perPage: $perPage) {
-            media(type: ANIME, sort: POPULARITY_DESC) {
-                id
-                title { english }
+            media(type: ANIME) {
                 episodes
+                id
+                idMal
+                type
+                format
+                status
+                description
+                season
+                seasonYear
+                seasonInt
+                episodes
+                duration
+                countryOfOrigin
+                source
+                hashtag
+                updatedAt
+                bannerImage
+                synonyms
+                siteUrl
+                title {
+                    romaji
+                    english
+                    native
+                    userPreferred
+                }
             }
         }
     }
@@ -25,7 +46,7 @@ class AnilistGenerator:
         self.page = page
         self.units = units
 
-    async def generate(self) -> List[dict]:
+    async def generate(self) -> list[dict]:
         """
         Fetches anime from AniList and returns a flat list of episode entries,
         each with a sanitized name and provider URL for both sub and dub.

@@ -1,8 +1,12 @@
 import asyncio
 import json
+import logging
 import mimetypes
 import shutil
 import subprocess
+import base64
+import io
+from random import uniform
 from pathlib import Path
 
 from telethon.tl.functions.messages import SendMediaRequest
@@ -10,8 +14,10 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
     DocumentAttributeVideo,
     InputMediaUploadedDocument,
+    UpdateMessageID,
 )
 
+from shared.metadata import Metadata
 from telegram.bot import client
 from telegram.constants import STORE_CHANNEL_ID
 from telegram.utils.parallel import UploadManager
@@ -73,6 +79,23 @@ def get_video_info(path: str | Path) -> dict:
     return _DEFAULT_VIDEO_INFO.copy()
 
 
+async def get_thumbnail(video_path, duration):
+    result = subprocess.run([
+        "ffmpeg", "-ss", str(uniform(0, duration)),
+        "-i", video_path, "-vframes", "1", "-q:v", "2",
+        "-f", "image2", "pipe:1"
+    ], capture_output=True, check=True)
+
+    ref = await client.upload_file(io.BytesIO(result.stdout), file_name="thumb.jpg")
+    return ref
+
+
+def get_msg_id(result: list):
+    for update in result.updates:
+            if isinstance(update, UpdateMessageID):
+                msg_id = update.id
+                return msg_id
+
 # ---------------------------------------------------------------------------
 # Upload worker
 # ---------------------------------------------------------------------------
@@ -92,11 +115,15 @@ async def upload_to_telegram(ctx) -> None:
     The worker blocks until the "p2" process is ready before entering the loop.
     """
     # Wait for the dependent process to be fully started before consuming work.
-    await asyncio.to_thread(ctx.wait_for, "p2")
+    logger = logging.getLogger(__name__)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, ctx.wait_for, "p2")
 
     while True:
-        metadata  = await asyncio.to_thread(ctx.data_q.get)
-        video_path = Path(metadata["video"])
+        s_metadata = await loop.run_in_executor(None, ctx.data_q.get)
+        metadata = Metadata.model_validate_json(s_metadata)
+        logger.info("Received data at uploader process")
+        video_path = Path(metadata.video)
 
         # --- Upload raw bytes to Telegram ---
         manager     = UploadManager(client=client, file_path=video_path)
@@ -114,13 +141,15 @@ async def upload_to_telegram(ctx) -> None:
             ),
         ]
 
+        thumb = await get_thumbnail(video_path=video_path, duration=video_info["duration"])
+
         # --- Send the document to the store channel ---
-        await client(  # type: ignore[operator]
+        result = await client(  # type: ignore[operator]
             SendMediaRequest(
                 peer=STORE_CHANNEL_ID,
                 media=InputMediaUploadedDocument(
                     file=uploaded,
-                    thumb=None,
+                    thumb=thumb,
                     mime_type=mime_type,
                     attributes=attributes,
                 ),
@@ -129,7 +158,7 @@ async def upload_to_telegram(ctx) -> None:
         )
 
         # Acknowledge completion so the coordinator can proceed.
-        ctx.ok_q.put({"job": "upload", "status": "done"}, timeout=10)
+        ctx.ok_q.put({"job": "upload", "status": "done", "channel_id": STORE_CHANNEL_ID, "msg_id": get_msg_id(result)}, timeout=10)
 
         # Clean up the working directory now that the upload is confirmed.
         shutil.rmtree(video_path.parent)

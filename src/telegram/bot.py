@@ -1,17 +1,6 @@
-import logging
-
 from telethon import TelegramClient
 
 from .constants import API_ID, API_HASH
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    format="[%(levelname)s %(asctime)s] %(name)s: %(message)s",
-    level=logging.WARNING,
-)
 
 # ---------------------------------------------------------------------------
 # Telegram client

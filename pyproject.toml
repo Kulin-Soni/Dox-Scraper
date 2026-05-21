@@ -12,5 +12,6 @@ dependencies = [
     "telethon>=1.43.2",
     "aiohttp>=3.13.5",
     "camoufox>=0.4.11",
-    "tqdm>=4.67.3"
+    "tqdm>=4.67.3",
+    "beanie>=2.1.0",
 ]

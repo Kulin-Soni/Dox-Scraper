@@ -3,6 +3,8 @@ import subprocess
 from pathlib import Path
 from shutil import which
 
+from shared.metadata import Metadata
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,7 +71,7 @@ def _write_parts_list(parts_file: Path, part_count: int) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def convert(metadata: dict) -> dict:
+async def convert(metadata: Metadata) -> Metadata:
     """
     Merge segmented .ts video parts and VTT subtitles into a single output file.
 
@@ -90,15 +92,15 @@ async def convert(metadata: dict) -> dict:
         raise RuntimeError("FFmpeg is not installed on the system.")
 
     # Build and write the concat list that FFmpeg will read.
-    parts_list_file = Path(metadata["dir"]) / "files.txt"
-    _write_parts_list(parts_list_file, int(metadata["parts"]))
+    parts_list_file = Path(metadata.dir) / "files.txt"
+    _write_parts_list(parts_list_file, int(metadata.parts))
 
-    output_path = Path(metadata["video"])
+    output_path = Path(metadata.video)
 
     # Convert all subtitles; silently drop any that ffmpeg cannot process.
     srt_subtitles = [
         srt
-        for subtitle in metadata["subtitles"]
+        for subtitle in metadata.subtitles
         if (srt := _convert_vtt_to_srt(subtitle)) is not None
     ]
 

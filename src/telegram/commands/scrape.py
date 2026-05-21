@@ -5,5 +5,5 @@ from core.handlers.process import app_ctx
 
 @Command(name="scrape", allowed=[1314824862])
 async def scrape(event: Message, client: TelegramClient):
-    # app_ctx.start("p1")
-    await event.respond("Not startable yet!")
+    app_ctx.start("p1")
+    await event.respond("🔎 Started scraping")

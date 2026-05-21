@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from ..bot import client
@@ -19,10 +20,12 @@ async def run_bot() -> None:
     3. Log the account name to confirm a successful login.
     4. Enter the Telethon event loop (returns only on disconnection).
     """
+    logger = logging.getLogger(__name__)
     await client.start(bot_token=BOT_TOKEN)  # type: ignore[union-attr]
 
     # loadCommands expects the *parent* of the 'commands' directory.
     loadCommands(_COMMANDS_ROOT)
+
 
     identity = await client.get_me()  # type: ignore[union-attr]
     if identity:
@@ -33,6 +36,6 @@ async def run_bot() -> None:
         else:
             display_name = "USER"
 
-        print(f"=> Logged in as {display_name} on Telegram")
+        logger.info("Logged in as %s on Telegram", display_name)
 
     await client.run_until_disconnected()  # type: ignore[union-attr]

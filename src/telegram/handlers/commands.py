@@ -1,6 +1,7 @@
+import logging
+
 from telegram.bot import client
 from telethon import TelegramClient, events
-# from telethon.events import Album
 from telethon.tl.custom.message import Message
 from pathlib import Path
 from typing import Callable, Awaitable, Any
@@ -22,8 +23,10 @@ def Command(name: str, allowed: list[int] | None = None):
     return decorator
 
 def loadCommands(mainDir: Path):
+    logger = logging.getLogger(__name__)
     path = Path(mainDir).resolve() / "commands" # initialized from main.py file
     cmds = list(filter(lambda x: x.name != "__init__.py" and (not x.name.startswith("h_")) and x.suffix == ".py" and x.is_file(), path.glob("*.py")))
     for cmd in cmds:
         import_module(f"telegram.commands.{cmd.stem}")
-    print("=> Commands initialized on Telegram")
+    logger.info("Commands initialized on Telegram")
+    

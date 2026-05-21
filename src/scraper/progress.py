@@ -12,7 +12,7 @@ class ProgressTracker:
     def save(self, page: int, items: list | None) -> None:
         """Saves the current page and item list to disk."""
         with open(self.location, "w", encoding="utf-8") as file:
-            json.dump({"page": page, "items": items}, file)
+            json.dump({"page": page, "items": items}, file, ensure_ascii=False)
 
     def load(self) -> tuple[int, list]:
         """Loads progress from disk. Returns (1, []) if no saved state exists."""

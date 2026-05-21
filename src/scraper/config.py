@@ -1,1 +1,0 @@
-PROVIDER_ORIGIN = "https://megaplay.buzz/"

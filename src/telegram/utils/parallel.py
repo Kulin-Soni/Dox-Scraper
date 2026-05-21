@@ -6,10 +6,12 @@
 
 import asyncio
 import hashlib
+import logging
 from math import ceil
 from os import replace, listdir
 from os.path import getsize
 from pathlib import Path
+import traceback
 from typing import Callable, Awaitable, Any
 
 import aiofiles
@@ -126,6 +128,7 @@ class CommonManager:
         self.progress = 0  # number of completed chunks
         self.progress_callback = progress_callback
         self.total_connections = self._connection_count_for(size)
+        self._logger = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -244,7 +247,6 @@ class DownloadManager(CommonManager):
             dc_id=dc_input.id,
         )
         self.total_connections = self._connection_count_for(self.size)
-        print("📡 TOTAL CONNECTIONS:", self.total_connections)
         await self.connection_manager.create_connections(self.total_connections)
 
     # ------------------------------------------------------------------
@@ -258,7 +260,7 @@ class DownloadManager(CommonManager):
             f"{Path(self.name).stem}_{crypt(15)}.bin",
         ).resolve()
 
-        print(f"\n📁 FILE: {self.name} ({self.size / (1024 * 1024):.2f} MB)")
+        self._logger.info("FILE: %s (%s MB)", self.name, f"{self.size / (1024 * 1024):.2f}")
         temp_file.parent.mkdir(parents=True, exist_ok=True)
         temp_file.touch(exist_ok=True)
 
@@ -267,8 +269,8 @@ class DownloadManager(CommonManager):
         total_connections = self.total_connections
         sem = asyncio.Semaphore(total_connections)
         failed_offsets: list[int] = []
-
-        async def download_chunk(offset: int, index: int, total_parts: int) -> None:
+        tqdm_bar = tqdm(total=self.parts, desc="Downloading")
+        async def download_chunk(offset: int, index: int, tqdm_bar) -> None:
             """Download one chunk and write it; record offset on failure."""
             async with sem:
                 self.progress += 1
@@ -276,7 +278,7 @@ class DownloadManager(CommonManager):
                 try:
                     data = await self._fetch_chunk(sender, offset)
                     await self._write_chunk(temp_file, offset, data)
-                    print(f"📝 CHUNK {index + 1}/{total_parts} WRITTEN!")
+                    tqdm_bar.update(1)
                 except Exception:
                     failed_offsets.append(offset)
 
@@ -286,7 +288,7 @@ class DownloadManager(CommonManager):
                 download_chunk(
                     offset=i * self.chunk_size,
                     index=i,
-                    total_parts=self.parts,
+                    tqdm_bar=tqdm_bar
                 )
                 for i in range(self.parts)
             ),
@@ -297,16 +299,16 @@ class DownloadManager(CommonManager):
         while failed_offsets:
             pending = failed_offsets.copy()
             failed_offsets.clear()
+            tqdm_bar = tqdm(total=len(pending), desc="Retry")
             await asyncio.gather(
                 *(
-                    download_chunk(offset=offset, index=idx, total_parts=len(pending))
+                    download_chunk(offset=offset, index=idx, tqdm_bar=tqdm_bar)
                     for idx, offset in enumerate(pending)
                 )
             )
 
         await self.connection_manager.disconnect_all()
         self._finalise_temp_file(temp_file, destination_folder)
-        print("✅ COMPLETED!")
 
 # ---------------------------------------------------------------------------
 # UploadManager
@@ -383,7 +385,7 @@ class UploadManager(CommonManager):
     # Public API
     # ------------------------------------------------------------------
 
-    async def upload_file(self) -> InputFile | InputFileBig:
+    async def upload_file(self) -> InputFile | InputFileBig | None:
         """
         Upload the file and return a Telegram InputFile handle.
 
@@ -391,41 +393,46 @@ class UploadManager(CommonManager):
         The MD5 checksum is only computed for small files (Telegram requirement).
         """
         is_big = self.size > self.BIG_FILE_THRESHOLD
-        await self._init_connections()
+        try:
+            await self._init_connections()
 
-        total_connections = self.total_connections
-        sem = asyncio.Semaphore(total_connections)
-        progress_bar = tqdm(total=self.parts, desc="Uploading")
-        md5 = hashlib.md5()
+            total_connections = self.total_connections
+            sem = asyncio.Semaphore(total_connections)
+            progress_bar = tqdm(total=self.parts, desc="Uploading")
+            md5 = hashlib.md5()
 
-        async def upload_chunk(part_index: int, data: bytes) -> None:
-            async with sem:
-                self.progress += 1
-                sender = self.connection_manager.senders[part_index % total_connections]
-                try:
-                    await self._send_chunk(sender, part_index, data, is_big)
-                    progress_bar.update(1)
-                except Exception:
-                    pass  # Failed parts are silently skipped (caller can validate).
+            async def upload_chunk(part_index: int, data: bytes) -> None:
+                async with sem:
+                    self.progress += 1
+                    sender = self.connection_manager.senders[part_index % total_connections]
+                    try:
+                        await self._send_chunk(sender, part_index, data, is_big)
+                        progress_bar.update(1)
+                    except Exception:
+                        self._logger.warning("Chunk upload failed")
+                        print(traceback.format_exc(limit=20))  # Failed parts are silently skipped (caller can validate).
 
-        # Queue all chunk tasks while streaming the file sequentially.
-        tasks: list[asyncio.Task] = []
-        part_index = 0
-        async for chunk in self._iter_chunks():
-            if not is_big:
-                md5.update(chunk)
-            tasks.append(asyncio.create_task(upload_chunk(part_index, chunk)))
-            part_index += 1
+            # Queue all chunk tasks while streaming the file sequentially.
+            tasks: list[asyncio.Task] = []
+            part_index = 0
+            async for chunk in self._iter_chunks():
+                if not is_big:
+                    md5.update(chunk)
+                tasks.append(asyncio.create_task(upload_chunk(part_index, chunk)))
+                part_index += 1
 
-        await asyncio.gather(*tasks, self._run_progress_loop())
-        await self.connection_manager.disconnect_all()
+            await asyncio.gather(*tasks, self._run_progress_loop())
+            await self.connection_manager.disconnect_all()
 
-        file_name = self.file_path.name
-        if is_big:
-            return InputFileBig(id=self.file_id, parts=self.parts, name=file_name)
-        return InputFile(
-            id=self.file_id,
-            parts=self.parts,
-            name=file_name,
-            md5_checksum=md5.hexdigest(),
-        )
+            file_name = self.file_path.name
+            if is_big:
+                return InputFileBig(id=self.file_id, parts=self.parts, name=file_name)
+            return InputFile(
+                id=self.file_id,
+                parts=self.parts,
+                name=file_name,
+                md5_checksum=md5.hexdigest(),
+            )
+        except Exception:
+            print(traceback.format_exc())
+            return None
