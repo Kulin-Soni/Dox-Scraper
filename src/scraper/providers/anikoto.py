@@ -3,6 +3,7 @@ import logging
 import shutil
 import traceback
 from pathlib import Path
+from typing import Union
 from urllib.parse import quote
 
 import aiofiles
@@ -49,7 +50,7 @@ class URLBuilder:
     def build_episode_entry(
         self,
         anime: dict,
-        episode: int,
+        episode: Union[int, str],
         content_type: str,
     ) -> dict[str, str]:
         """
@@ -60,7 +61,13 @@ class URLBuilder:
         """
         anime_id        = anime["id"]
         sanitized_title = sanitize_filename(anime["title"]["english"]).replace(" ", "_")
-        name            = f"{anime_id}_{sanitized_title}_episode_{episode}_{content_type}"
+        if not episode=="" or episode==0:
+            name            = f"{anime_id}_{sanitized_title}_{content_type}"
+        elif content_type=="":
+            name            = f"{anime_id}_{sanitized_title}_episode_{episode}"
+        else:
+            name            = f"{anime_id}_{sanitized_title}_episode_{episode}_{content_type}"
+
         url             = f"{PROVIDER}/{anime_id}/{episode}/{content_type}"
         return {"name": name, "url": url}
 

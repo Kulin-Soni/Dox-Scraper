@@ -1,5 +1,6 @@
 import asyncio
 import copy
+from itertools import chain
 import logging
 import shutil
 import traceback
@@ -24,14 +25,15 @@ from core.handlers.process import app_ctx
 # Constants
 # ---------------------------------------------------------------------------
 
-TEMP_DIR     = Path("./temp")
-RECORD_FILE  = Path("record.json")
+TEMP_DIR = Path("./temp")
+RECORD_FILE = Path("record.json")
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _clear_temp() -> None:
     """Remove the temp directory and all its contents if it exists."""
@@ -85,7 +87,9 @@ async def _upload_to_telegram(metadata: Metadata) -> tuple[bool, Any, Any]:
     return success, response.get("channel_id"), response.get("msg_id")
 
 
-def _compute_remaining_track(anime_list: list, anime_index: int, entry_index: int) -> list:
+def _compute_remaining_track(
+    anime_list: list, anime_index: int, entry_index: int
+) -> list:
     """
     Return a deep-copied slice of ``anime_list`` starting from the entry that
     follows ``entry_index`` within ``anime_index``.
@@ -94,11 +98,23 @@ def _compute_remaining_track(anime_list: list, anime_index: int, entry_index: in
     anime in the list is used as the starting point instead.
     """
     remaining = copy.deepcopy(anime_list)
-    remaining[anime_index]["entries"] = remaining[anime_index]["entries"][entry_index:]
+    remaining[anime_index]["entries"] = remaining[anime_index]["entries"][
+        entry_index + 1 :
+    ]
 
     if remaining[anime_index]["entries"]:
         return remaining[anime_index:]
-    return remaining[anime_index + 1:]
+    return remaining[anime_index + 1 :]
+
+
+def _queries(metadata: Metadata, anilist_info: dict):
+    file_name_queries: list[str] = Path(metadata.video).stem.split("_")
+    synonym_queries: list[str] = list(
+        chain.from_iterable(
+            [synonym.split(" ") for synonym in anilist_info["info"]["synonyms"]]
+        )
+    )
+    return file_name_queries + synonym_queries
 
 
 async def _scrape_convert_and_upload(
@@ -117,7 +133,7 @@ async def _scrape_convert_and_upload(
     Returns True on success (or when no metadata was returned), False if the
     upload step fails so the caller can decide whether to abort.
     """
-    scraper  = Scraper()
+    scraper = Scraper()
     metadata = await scraper.scrape(entry, browser_ctx, session)
 
     if not metadata:
@@ -134,13 +150,11 @@ async def _scrape_convert_and_upload(
         logger.warning("Uploader reported failure for entry: %s", entry.get("name"))
         return False
 
-    # Build search query tokens from the output filename stem.
-    queries: list[str] = Path(metadata.video).stem.split("_")
     try:
         await TelegramFile(
             channel_id=channel_id,
             msg_id=msg_id,
-            queries=queries,
+            queries=_queries(metadata, anilist_info),
             anilist_id=anilist_info["info"]["id"],
         ).create()
         logger.info("Saved to DB")
@@ -154,6 +168,7 @@ async def _scrape_convert_and_upload(
 # ---------------------------------------------------------------------------
 # Scraping modes
 # ---------------------------------------------------------------------------
+
 
 async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) -> None:
     """
@@ -170,8 +185,10 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
         for j, entry in enumerate(entries):
             logger.info(
                 "Scrape job: [entry %s/%s | anime %s/%s]",
-                j + 1, len(entries),
-                i + 1, len(anime_list),
+                j + 1,
+                len(entries),
+                i + 1,
+                len(anime_list),
             )
             success = await _scrape_convert_and_upload(entry, ctx, session, anime)
             if success:
@@ -199,13 +216,16 @@ async def _requested_scraping(
         logger.warning("Anilist entry not found for ID: %s", request.anilist_id)
         return False
 
-    entry = URLBuilder().build_episode_entry(anime_info, request.episode, request.content_type)
+    entry = URLBuilder().build_episode_entry(
+        anime_info, request.episode, request.content_type
+    )
     return await _scrape_convert_and_upload(entry, ctx, session, anime_info)
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 async def scrape_job() -> None:
     """
