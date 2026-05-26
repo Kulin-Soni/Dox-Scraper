@@ -45,7 +45,7 @@ def _clear_temp() -> None:
 
 async def _load_or_generate_anime_list(
     tracker: ProgressTracker,
-) -> tuple[int, list]:
+) -> tuple[int, int, list]:
     """
     Return saved progress if available, otherwise generate a fresh anime list.
 
@@ -53,9 +53,9 @@ async def _load_or_generate_anime_list(
 
         {"info": <anilist dict>, "entries": <list of episode entry dicts>}
     """
-    page, items = tracker.load()
+    page, index, items = tracker.load()
     if items:
-        return page, items
+        return page, index, items
 
     raw_anime_list = await Anilist().generate(page, 1)
     grouped_entries = URLBuilder(anime_list=raw_anime_list).build()
@@ -64,7 +64,7 @@ async def _load_or_generate_anime_list(
         {"info": data, "entries": entry}
         for data, entry in zip(raw_anime_list, grouped_entries)
     ]
-    return page, anime_list
+    return page, index, anime_list
 
 
 async def _upload_to_telegram(metadata: Metadata) -> tuple[bool, Any, Any]:
@@ -98,13 +98,9 @@ def _compute_remaining_track(
     anime in the list is used as the starting point instead.
     """
     remaining = copy.deepcopy(anime_list)
-    remaining[anime_index]["entries"] = remaining[anime_index]["entries"][
-        entry_index + 1 :
-    ]
+    remaining[anime_index]["index"] = entry_index
 
-    if remaining[anime_index]["entries"]:
-        return remaining[anime_index:]
-    return remaining[anime_index + 1 :]
+    return remaining
 
 
 def _queries(metadata: Metadata, anilist_info: dict):
@@ -179,9 +175,9 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
     if interrupted. When the list is exhausted the page counter is incremented.
     """
     tracker = ProgressTracker(RECORD_FILE)
-    page, anime_list = await _load_or_generate_anime_list(tracker)
+    page, index, anime_list = await _load_or_generate_anime_list(tracker)
 
-    for i, anime in enumerate(anime_list):
+    for i, anime in enumerate(anime_list[index:]):
         entries = anime["entries"]
         for j, entry in enumerate(entries):
             logger.info(
@@ -193,9 +189,10 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
             )
             success = await _scrape_convert_and_upload(entry, ctx, session, anime)
             if success:
-                tracker.save(page, _compute_remaining_track(anime_list, i, j))
+                tracker.save(page, _compute_remaining_track(anime_list, i, j+1), i)
+        tracker.save(page, anime_list, i+1)
 
-    tracker.save(page + 1, None)
+    tracker.save(page + 1, None, 0)
 
 
 async def _requested_scraping(
