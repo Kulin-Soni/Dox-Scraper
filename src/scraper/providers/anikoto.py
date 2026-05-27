@@ -3,13 +3,13 @@ import logging
 import shutil
 import traceback
 from pathlib import Path
-from typing import Union
 from urllib.parse import quote
 
 import aiofiles
 import aiohttp
 from camoufox.async_api import BrowserContext  # type: ignore
 from pathvalidate import sanitize_filename
+from playwright.async_api import ElementHandle
 from tqdm.asyncio import tqdm
 
 from shared.models import Metadata
@@ -18,9 +18,9 @@ from shared.models import Metadata
 # Constants
 # ---------------------------------------------------------------------------
 
-CONTENT_TYPES:   list[str] = ["sub", "dub"]
-PROVIDER_ORIGIN: str       = "https://megaplay.buzz/"
-PROVIDER:        str       = f"{PROVIDER_ORIGIN}/stream/ani"
+CONTENT_TYPES: list[str] = ["sub", "dub"]
+PROVIDER_ORIGIN: str = "https://megaplay.buzz/"
+PROVIDER: str = f"{PROVIDER_ORIGIN}/stream/ani"
 
 # Maximum concurrent TS chunk downloads per scrape session.
 _MAX_CONCURRENT_DOWNLOADS = 75
@@ -37,6 +37,7 @@ _PLAYER_WAIT_INCREMENT = 0.5
 # ---------------------------------------------------------------------------
 # URL Builder
 # ---------------------------------------------------------------------------
+
 
 class URLBuilder:
     """Builds a flat list of per-anime episode stream entries."""
@@ -61,7 +62,7 @@ class URLBuilder:
         If ``url`` is provided it is used as-is; otherwise it is built from
         the provider base URL + anime id + episode + content type.
         """
-        anime_id        = anime["id"]
+        anime_id = anime["id"]
         sanitized_title = sanitize_filename(anime["title"]["english"]).replace(" ", "_")
 
         if episode in ("", 0):
@@ -72,11 +73,11 @@ class URLBuilder:
             name = f"{anime_id}_{sanitized_title}_episode_{episode}_{content_type}"
 
         return {
-            "name":         name,
-            "url":          url or f"{PROVIDER}/{anime_id}/{episode}/{content_type}",
-            "episode":      episode,
+            "name": name,
+            "url": url or f"{PROVIDER}/{anime_id}/{episode}/{content_type}",
+            "episode": episode,
             "content_type": content_type,
-            "provider":     "anikoto",
+            "provider": "anikoto",
         }
 
     def build(self) -> list[list[dict]]:
@@ -108,11 +109,11 @@ class Scraper:
     """
 
     def __init__(self) -> None:
-        self._chunk_urls:    list[str]   = []
-        self._current_title: str         = ""
-        self._output_dir:    Path | None = None
-        self._metadata:      Metadata    = Metadata()
-        self._media_found:   bool        = False
+        self._chunk_urls: list[str] = []
+        self._current_title: str = ""
+        self._output_dir: Path | None = None
+        self._metadata: Metadata = Metadata()
+        self._media_found: bool = False
         self._headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
             "Accept": "*/*",
@@ -125,7 +126,7 @@ class Scraper:
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "cross-site",
-    }
+        }
         self._logger = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
@@ -135,6 +136,11 @@ class Scraper:
     async def _on_browser_response(self, response) -> None:
         """Route every captured network response to the appropriate handler."""
         await self._handle_m3u8_or_vtt(response)
+
+    async def _is_invalid_url(self, frame: ElementHandle | None) -> bool:
+        if not frame:
+            return True
+        return await (await frame.content_frame()).query_selector(".error-container") is not None  # type: ignore
 
     async def _handle_m3u8_or_vtt(self, response) -> None:
         """
@@ -157,8 +163,8 @@ class Scraper:
             content = await response.text()
             # Derive a clean filename from the last URL path segment,
             # stripping the extension before appending .vtt.
-            raw_segment     = url.rsplit("/", maxsplit=1)[-1]
-            subtitle_stem   = "_".join(raw_segment.split(".")[:-1])
+            raw_segment = url.rsplit("/", maxsplit=1)[-1]
+            subtitle_stem = "_".join(raw_segment.split(".")[:-1])
             subtitle_filename = f"{subtitle_stem}.vtt"
             await self._save_subtitle(content, subtitle_filename)
 
@@ -216,7 +222,7 @@ class Scraper:
                     async with semaphore:
                         async with aiofiles.open(temp_path, "w+b") as f:
                             response = await session.get(url, headers=self._headers)
-                            data     = await response.read()
+                            data = await response.read()
                             await f.write(data)
                             await f.flush()
 
@@ -226,7 +232,9 @@ class Scraper:
                     self._logger.error("[chunk %s] Download failed:", index)
                     print(traceback.format_exc())
 
-        with tqdm(total=len(self._chunk_urls), unit="chunks", desc="Downloading") as bar:
+        with tqdm(
+            total=len(self._chunk_urls), unit="chunks", desc="Downloading"
+        ) as bar:
             await asyncio.gather(
                 *(
                     asyncio.create_task(download_chunk(url, i, bar))
@@ -234,9 +242,9 @@ class Scraper:
                 )
             )
 
-        output_path              = self._output_dir / f"{self._current_title}.mkv"
-        self._metadata.video     = output_path.as_posix()
-        self._metadata.parts     = len(self._chunk_urls)
+        output_path = self._output_dir / f"{self._current_title}.mkv"
+        self._metadata.video = output_path.as_posix()
+        self._metadata.parts = len(self._chunk_urls)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -269,7 +277,10 @@ class Scraper:
 
                 proxied_url = f"http://localhost:8280?url={quote(target['url'])}"
                 await page.goto(proxied_url)
-                await page.wait_for_load_state("domcontentloaded")
+                frame = await page.wait_for_selector("iframe#scrap")
+
+                if await self._is_invalid_url(frame):
+                    return None
 
                 # Allow the player time to issue playlist requests.
                 # Wait time grows with each retry to handle slow servers.
@@ -286,7 +297,6 @@ class Scraper:
                 # No video stream detected; remove any temp directory.
                 if metadata.dir:
                     shutil.rmtree(metadata.dir)
-                return None
 
             except Exception:
                 self._logger.error("[scrape] Error for '%s':", target.get("name"))

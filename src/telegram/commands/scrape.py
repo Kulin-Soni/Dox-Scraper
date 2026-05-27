@@ -16,14 +16,26 @@ Invalid parameters.
 `/scrape [provider] [anilist_id] [episode] [content_type]` — single episode (url optional)
 `/scrape [provider] [url] [anilist_id] [episode] [content_type]` — single episode with explicit url
 
+**Parameters:**
+`[provider]`: Any of the registered providers, use `/providers` to list all of them.
+
+`[url]`: Url to scrape. Must be same as the provider's registered url. Will be ignored otherwise.
+
+`[anilist_id]`: Can be found at `https://anilist.co/search/anime`. If wrong, request is ignored.
+
+`[episode]`: Episode no to scrape, request will be ignored if episode specified is greater than total episodes.
+
+`[content_type]`: "sub" or "dub" (without quotes).If not specified, uses "sub".
+
 **Examples:**
 `/scrape auto`
 `/scrape anikoto 21`
 `/scrape anikoto 21 5 sub`
 `/scrape anikoto https://megaplay.buzz/stream/ani/21/5/sub 21 5 sub`
+
 """
 
-success_str = "Queued. Details:\n"
+success_str = "Added to queue. \n\nDetails:\n"
 
 MAX_PARAMS = 5
 

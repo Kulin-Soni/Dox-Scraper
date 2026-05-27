@@ -24,7 +24,7 @@ class IframeProxyHandler(http.server.BaseHTTPRequestHandler):
                 <title>Player</title>
             </head>
             <body style="width: 100dvw; height: 100dvh;">
-                <iframe src="{embed_url}" width="100%" height="100%"
+                <iframe src="{embed_url}" id="scrap" width="100%" height="100%"
                         frameborder="0" scrolling="no" allowfullscreen muted></iframe>
             </body>
             </html>

@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import mimetypes
 import shutil
 import subprocess
 import io
@@ -130,7 +129,6 @@ async def upload_to_telegram() -> None:
         uploaded    = await manager.upload_file()
         video_info  = get_video_info(video_path)
 
-        mime_type = mimetypes.guess_type(video_path)[0] or "application/octet-stream"
         attributes = [
             DocumentAttributeFilename(video_path.name),
             DocumentAttributeVideo(
@@ -150,7 +148,7 @@ async def upload_to_telegram() -> None:
                 media=InputMediaUploadedDocument(
                     file=uploaded,
                     thumb=thumb,
-                    mime_type=mime_type,
+                    mime_type="application/octet-stream",
                     attributes=attributes,
                 ),
                 message=video_path.name,

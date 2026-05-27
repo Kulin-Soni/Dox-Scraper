@@ -30,6 +30,7 @@ from core.handlers.process import app_ctx
 
 TEMP_DIR = Path("./temp")
 RECORD_FILE = Path("record.json")
+CONTENT_TYPES = ("sub", "dub")
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +91,14 @@ async def _scrape_convert_and_upload(
     browser_ctx: BrowserContext,
     session: aiohttp.ClientSession,
     anilist_info: dict,
+    anime_doc: ScrapedAnime
 ) -> bool:
     scraper = Scraper()
     metadata = await scraper.scrape(entry, browser_ctx, session)
 
     if not metadata:
         logger.info("No metadata for entry: %s", entry.get("name"))
-        return True
+        return False
 
     logger.info("Merging & converting to MKV")
     metadata = await convert(metadata)
@@ -115,19 +117,10 @@ async def _scrape_convert_and_upload(
             queries=_queries(metadata, anilist_info),
             anilist_id=anilist_info["info"]["id"],
         ).create()
-
-        info = anilist_info["info"]
-        anime_doc = await ScrapedAnime.get_or_create(
-            anilist_id=info["id"],
-            title=info["title"].get("english", ""),
-            is_airing=info.get("status") == "RELEASING",
-            anime_info=info,
+        await anime_doc.mark_scraped(
+            episode=entry["episode"],
+            content_type=entry.get("content_type", "sub"),
         )
-        if anime_doc:
-            await anime_doc.mark_scraped(
-                episode=entry["episode"],
-                content_type=entry.get("content_type", "sub"),
-            )
         logger.info("Saved to DB")
     except Exception:
         logger.error("[mongo] Error saving to DB:\n%s", traceback.format_exc())
@@ -148,9 +141,30 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
     page, index, anime_list = await _load_or_generate_anime_list(tracker)
 
     for i, anime in enumerate(anime_list[index:]):
+
+        anime_info = anime["info"]
+        is_airing = anime_info.get("status") == "RELEASING"
+
+        anime_doc = await ScrapedAnime.get_or_create(
+            anilist_id=anime_info["id"],
+            title=anime_info["title"].get("english", ""),
+            is_airing=is_airing,
+            anime_info=anime_info,
+        )
+
+        if anime_doc is None:
+            logger.warning(
+                "Could not resolve episode count for anilist_id=%s, skipping",
+                anime_info["id"],
+            )
+            return
+        elif all(anime_doc.is_complete(content_type) for content_type in CONTENT_TYPES):
+            return
+
         entries = anime["entries"]
         entry_index = anime.get("index", 0)
         for j, entry in enumerate(entries[entry_index:]):
+
             logger.info(
                 "Auto scrape: [ep %s/%s | anime %s/%s]",
                 j + 1,
@@ -158,30 +172,13 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
                 i + 1,
                 len(anime_list[index:]),
             )
-            success = await _scrape_convert_and_upload(entry, ctx, session, anime)
-            if success:
-                tracker.save(
-                    page,
-                    _compute_remaining_track(anime_list, i, entry_index + j + 1),
-                    i,
-                )
-            else:
-                anime_info = anime["info"]
-                is_airing = anime_info.get("status") == "RELEASING"
-                anime_doc = await ScrapedAnime.get_or_create(
-                    anilist_id=anime_info["id"],
-                    title=anime_info["title"].get("english", ""),
-                    is_airing=is_airing,
-                    anime_info=anime_info,
-                )
-
-                if anime_doc is None:
-                    logger.warning(
-                        "Could not resolve episode count for anilist_id=%s, skipping",
-                        anime_info["id"],
-                    )
-                    return
-
+            success = await _scrape_convert_and_upload(entry, ctx, session, anime, anime_doc)
+            tracker.save(
+                page,
+                _compute_remaining_track(anime_list, i, entry_index + j + 1),
+                i,
+            )
+            if not success:
                 await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
 
         tracker.save(page, anime_list, index + i + 1)
@@ -214,9 +211,10 @@ async def _single_scrape(
     )
 
     is_airing = anime_info.get("status") == "RELEASING"
+
     anime_doc = await ScrapedAnime.get_or_create(
         anilist_id=request.anilist_id,
-        title=anime_info.get("title", ""),
+        title=anime_info["title"].get("english", ""),
         is_airing=is_airing,
         anime_info=anime_info,
     )
@@ -227,8 +225,10 @@ async def _single_scrape(
             request.anilist_id,
         )
         return False
+    elif request.episode in anime_doc.scraped(request.content_type):
+        return True
 
-    ok = await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info})
+    ok = await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info}, anime_doc)
     if not ok:
         await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
         return False
@@ -260,7 +260,7 @@ async def _anime_scrape(
 
     anime_doc = await ScrapedAnime.get_or_create(
         anilist_id=request.anilist_id,
-        title=anime_info.get("title", ""),
+        title=anime_info["title"].get("english", ""),
         is_airing=is_airing,
         anime_info=anime_info,
     )
@@ -274,28 +274,28 @@ async def _anime_scrape(
 
     # Retry previously failed episodes first, then missing ones
     entries = []
-    for content_type in ("sub", "dub"):
+    for content_type in CONTENT_TYPES:
         failed = list(anime_doc.failed(content_type))
         missing = anime_doc.missing_episodes(content_type)
         episodes_to_scrape = sorted(set(failed + missing))
-
-        if not episodes_to_scrape:
-            logger.info(
-                "Nothing to scrape for anilist_id=%s (%s)",
-                request.anilist_id,
-                content_type,
-            )
-            return
 
         entries += [
             URLBuilder().build_episode_entry(anime_info, ep, content_type)
             for ep in episodes_to_scrape
         ]
 
+    if not entries:
+        logger.info(
+            "Nothing to scrape for anilist_id=%s (%s)",
+            request.anilist_id,
+            content_type,
+        )
+        return
+
     for i, entry in enumerate(entries):
         logger.info("Anime scraping: (%s/%s)", i+1, len(entries))
 
-        ok = await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info})
+        ok = await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info}, anime_doc)
         if not ok:
             await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
 
