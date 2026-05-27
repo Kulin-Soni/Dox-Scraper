@@ -33,6 +33,11 @@ ANILIST_GENERATOR_QUERY = """
                     native
                     userPreferred
                 }
+                nextAiringEpisode {
+                    episode
+                    airingAt
+                    timeUntilAiring
+                }
             }
         }
     }
@@ -64,6 +69,11 @@ ANILIST_FIND_QUERY = """
                     english
                     native
                     userPreferred
+                }
+                nextAiringEpisode {
+                    episode
+                    airingAt
+                    timeUntilAiring
                 }
         }
     }

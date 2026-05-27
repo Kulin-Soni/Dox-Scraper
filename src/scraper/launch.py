@@ -165,6 +165,25 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
                     _compute_remaining_track(anime_list, i, entry_index + j + 1),
                     i,
                 )
+            else:
+                anime_info = anime["info"]
+                is_airing = anime_info.get("status") == "RELEASING"
+                anime_doc = await ScrapedAnime.get_or_create(
+                    anilist_id=anime_info["id"],
+                    title=anime_info["title"].get("english", ""),
+                    is_airing=is_airing,
+                    anime_info=anime_info,
+                )
+
+                if anime_doc is None:
+                    logger.warning(
+                        "Could not resolve episode count for anilist_id=%s, skipping",
+                        anime_info["id"],
+                    )
+                    return
+
+                await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
+
         tracker.save(page, anime_list, index + i + 1)
 
     tracker.save(page + 1, None, 0)
@@ -191,9 +210,30 @@ async def _single_scrape(
         anime_info,
         request.episode,
         request.content_type,
-        url=request.url or None,  # pass None → URLBuilder constructs it
+        url=request.url or None,  # None → URLBuilder constructs it
     )
-    return await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info})
+
+    is_airing = anime_info.get("status") == "RELEASING"
+    anime_doc = await ScrapedAnime.get_or_create(
+        anilist_id=request.anilist_id,
+        title=anime_info.get("title", ""),
+        is_airing=is_airing,
+        anime_info=anime_info,
+    )
+
+    if anime_doc is None:
+        logger.warning(
+            "Could not resolve episode count for anilist_id=%s, skipping",
+            request.anilist_id,
+        )
+        return False
+
+    ok = await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info})
+    if not ok:
+        await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
+        return False
+
+    return True
 
 
 async def _anime_scrape(
@@ -258,7 +298,6 @@ async def _anime_scrape(
         ok = await _scrape_convert_and_upload(entry, ctx, session, {"info": anime_info})
         if not ok:
             await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
-            break
 
 
 # ---------------------------------------------------------------------------
