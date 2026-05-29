@@ -1,53 +1,50 @@
-import asyncio
-import logging
+"""
+scrapers/anikoto.py
+===================
+Scraper implementation for the Anikoto provider (via megaplay.buzz).
+
+Provider details
+----------------
+- Stream URLs are routed through a local proxy at ``http://localhost:8280``
+  so Camoufox can intercept and forward HLS requests.
+- Content is identified by an ``iframe#scrap`` element; absence of that
+  element, or the presence of ``.error-container`` inside it, signals an
+  invalid / unavailable episode.
+"""
+
 import shutil
 import traceback
-from pathlib import Path
 from urllib.parse import quote
 
-import aiofiles
 import aiohttp
 from camoufox.async_api import BrowserContext  # type: ignore
 from pathvalidate import sanitize_filename
-from playwright.async_api import ElementHandle
-from tqdm.asyncio import tqdm
 
+from scraper.base import BaseScraper, _BASE_PLAYER_WAIT, _MAX_ATTEMPTS, _PLAYER_WAIT_INCREMENT
 from shared.models import Metadata
+
+import asyncio
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 CONTENT_TYPES: list[str] = ["sub", "dub"]
+
 PROVIDER_ORIGIN: str = "https://megaplay.buzz/"
 PROVIDER: str = f"{PROVIDER_ORIGIN}/stream/ani"
 
-# Maximum concurrent TS chunk downloads per scrape session.
-_MAX_CONCURRENT_DOWNLOADS = 75
-
-# Maximum page-load attempts before giving up on a single target.
-_MAX_ATTEMPTS = 20
-
-# Base wait time (seconds) before declaring the player has fired its requests.
-# Each retry adds an extra 0.5 s to allow slower servers more time.
-_BASE_PLAYER_WAIT = 5.0
-_PLAYER_WAIT_INCREMENT = 0.5
-
 
 # ---------------------------------------------------------------------------
-# URL Builder
+# URL builder
 # ---------------------------------------------------------------------------
 
 
 class URLBuilder:
-    """Builds a flat list of per-anime episode stream entries."""
+    """Builds a flat list of per-anime episode stream entries for Anikoto."""
 
     def __init__(self, anime_list: list[dict] | None = None) -> None:
         self.anime_list: list[dict] = anime_list if anime_list is not None else []
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def build_episode_entry(
         self,
@@ -57,10 +54,27 @@ class URLBuilder:
         url: str | None = None,
     ) -> dict[str, str | int]:
         """
-        Construct a single episode entry.
+        Construct a single episode entry dict.
 
-        If ``url`` is provided it is used as-is; otherwise it is built from
-        the provider base URL + anime id + episode + content type.
+        If ``url`` is provided it is used as-is; otherwise the URL is built
+        from the provider base URL, anime id, episode number, and content type.
+
+        Parameters
+        ----------
+        anime:
+            Anime dict containing at least ``"id"``, ``"title.english"``,
+            and ``"episodes"``.
+        episode:
+            Episode number, or ``""`` / ``0`` for a standalone (non-episodic) entry.
+        content_type:
+            ``"sub"`` or ``"dub"``.
+        url:
+            Optional override URL. When omitted the URL is constructed automatically.
+
+        Returns
+        -------
+        dict
+            Entry dict compatible with ``BaseScraper.scrape()``.
         """
         anime_id = anime["id"]
         sanitized_title = sanitize_filename(anime["title"]["english"]).replace(" ", "_")
@@ -83,7 +97,13 @@ class URLBuilder:
     def build(self) -> list[list[dict]]:
         """
         Generate all sub/dub episode entries grouped by anime.
-        Skips anime whose episode count is falsy (None, 0, empty string).
+        Anime with a falsy episode count (``None``, ``0``, ``""``) are skipped.
+
+        Returns
+        -------
+        list[list[dict]]
+            Outer list: one element per anime.
+            Inner list: one entry per (episode × content_type) combination.
         """
         entries: list[list[dict]] = []
 
@@ -101,153 +121,45 @@ class URLBuilder:
         return entries
 
 
-class Scraper:
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
+
+
+class Scraper(BaseScraper):
     """
-    Intercepts HLS (.m3u8) streams and subtitle (.vtt) files loaded by a
-    Camoufox browser page, downloads all TS chunks in parallel, and records
-    metadata about the resulting files for downstream processing.
+    Anikoto-specific scraper.
+
+    Navigates to each episode URL through the local proxy server, waits for
+    the HLS player to issue its playlist requests, then delegates chunk
+    downloading to the base class.
     """
 
-    def __init__(self) -> None:
-        self._chunk_urls: list[str] = []
-        self._current_title: str = ""
-        self._output_dir: Path | None = None
-        self._metadata: Metadata = Metadata()
-        self._media_found: bool = False
-        self._headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "Origin": PROVIDER_ORIGIN,
-            "Referer": PROVIDER_ORIGIN,
-            "Connection": "keep-alive",
-            "Sec-GPC": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "cross-site",
-        }
-        self._logger = logging.getLogger(__name__)
+    PROVIDER_ORIGIN = "https://megaplay.buzz/"
 
     # ------------------------------------------------------------------
-    # Browser response interception
+    # Provider-specific helpers
     # ------------------------------------------------------------------
 
-    async def _on_browser_response(self, response) -> None:
-        """Route every captured network response to the appropriate handler."""
-        await self._handle_m3u8_or_vtt(response)
+    async def _is_invalid_url(self, frame) -> bool:
+        """
+        Return ``True`` if the iframe is missing or shows an error overlay.
 
-    async def _is_invalid_url(self, frame: ElementHandle | None) -> bool:
+        Parameters
+        ----------
+        frame:
+            The ``ElementHandle`` for ``iframe#scrap``, or ``None`` if the
+            selector timed out.
+        """
         if not frame:
             return True
-        return await (await frame.content_frame()).query_selector(".error-container") is not None  # type: ignore
-
-    async def _handle_m3u8_or_vtt(self, response) -> None:
-        """
-        Parse HLS media playlist responses to collect TS chunk URLs,
-        or persist subtitle (VTT) responses to disk.
-
-        Only media playlists (those containing ``#EXTINF`` tags) are
-        processed; master playlists that list quality levels are ignored.
-        """
-        url = str(response.url)
-
-        if url.endswith(".m3u8"):
-            content = await response.text()
-            if "#EXTINF" in content:
-                for line in content.splitlines():
-                    if line.startswith("https://"):
-                        self._chunk_urls.append(line)
-
-        elif url.endswith(".vtt"):
-            content = await response.text()
-            # Derive a clean filename from the last URL path segment,
-            # stripping the extension before appending .vtt.
-            raw_segment = url.rsplit("/", maxsplit=1)[-1]
-            subtitle_stem = "_".join(raw_segment.split(".")[:-1])
-            subtitle_filename = f"{subtitle_stem}.vtt"
-            await self._save_subtitle(content, subtitle_filename)
+        return (
+            await (await frame.content_frame()).query_selector(".error-container")
+            is not None
+        )
 
     # ------------------------------------------------------------------
-    # Subtitle handling
-    # ------------------------------------------------------------------
-
-    def _ensure_output_dir(self) -> None:
-        """Create the per-title temp directory if it does not exist yet."""
-        if self._output_dir is None:
-            self._output_dir = Path("./temp") / self._current_title
-            self._output_dir.mkdir(exist_ok=True, parents=True)
-            self._metadata.dir = self._output_dir.as_posix()
-
-    async def _save_subtitle(self, content: str, filename: str) -> None:
-        """
-        Append subtitle content to a VTT file inside the output directory.
-
-        Appending (rather than overwriting) handles cases where a single
-        subtitle file is streamed in multiple response chunks.
-        """
-        self._ensure_output_dir()
-        subtitle_path = self._output_dir / f"{self._current_title}_{filename}.vtt"
-
-        async with aiofiles.open(subtitle_path.resolve(), "a") as f:
-            await f.write(content)
-
-        self._metadata.subtitles.append(subtitle_path.as_posix())
-
-    # ------------------------------------------------------------------
-    # Chunk download and merge
-    # ------------------------------------------------------------------
-
-    async def _download_chunks(self, session: aiohttp.ClientSession) -> None:
-        """
-        Download all collected TS chunk URLs concurrently and write each to a
-        numbered temp file (``temp_0.ts``, ``temp_1.ts``, …).
-
-        A semaphore caps concurrency at ``_MAX_CONCURRENT_DOWNLOADS`` to avoid
-        overwhelming the CDN. Failed chunks are logged but do not abort the
-        overall download.
-        """
-        if not self._chunk_urls:
-            return
-
-        self._ensure_output_dir()
-        self._media_found = True
-
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
-
-        async def download_chunk(url: str, index: int, progress_bar: tqdm) -> None:
-            temp_path = self._output_dir / f"temp_{index}.ts"
-            for _ in range(_MAX_ATTEMPTS):
-                try:
-                    async with semaphore:
-                        async with aiofiles.open(temp_path, "w+b") as f:
-                            response = await session.get(url, headers=self._headers)
-                            data = await response.read()
-                            await f.write(data)
-                            await f.flush()
-
-                    progress_bar.update(1)
-                    break
-                except Exception:
-                    self._logger.error("[chunk %s] Download failed:", index)
-                    print(traceback.format_exc())
-
-        with tqdm(
-            total=len(self._chunk_urls), unit="chunks", desc="Downloading"
-        ) as bar:
-            await asyncio.gather(
-                *(
-                    asyncio.create_task(download_chunk(url, i, bar))
-                    for i, url in enumerate(self._chunk_urls)
-                )
-            )
-
-        output_path = self._output_dir / f"{self._current_title}.mkv"
-        self._metadata.video = output_path.as_posix()
-        self._metadata.parts = len(self._chunk_urls)
-
-    # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry point (implements BaseScraper.scrape)
     # ------------------------------------------------------------------
 
     async def scrape(
@@ -257,14 +169,29 @@ class Scraper:
         http_session: aiohttp.ClientSession,
     ) -> Metadata | None:
         """
-        Navigate to ``target["url"]`` through the local proxy server, capture
-        HLS responses, download all TS chunks, and return a Metadata object.
+        Navigate to ``target["url"]`` via the local proxy, capture HLS
+        responses, download all TS chunks, and return a ``Metadata`` object.
 
         The URL is routed through ``http://localhost:8280`` so Camoufox can
-        intercept and forward stream requests. Each retry adds extra wait time
-        to accommodate slower servers.
+        intercept and forward stream requests.  Each retry adds extra wait
+        time (up to ``_MAX_ATTEMPTS * _PLAYER_WAIT_INCREMENT`` seconds) to
+        accommodate slower CDNs.
 
-        Returns None if no media was detected or an unrecoverable error occurs.
+        Parameters
+        ----------
+        target:
+            Entry dict from ``URLBuilder.build_episode_entry()``.
+        browser_ctx:
+            Live Camoufox ``BrowserContext``.
+        http_session:
+            Live ``aiohttp.ClientSession`` for chunk downloads.
+
+        Returns
+        -------
+        Metadata
+            Populated on success.
+        None
+            If the URL is invalid, no media was found, or an error occurred.
         """
         metadata = Metadata()
         self._current_title = target["name"]
@@ -282,7 +209,6 @@ class Scraper:
                     return None
 
                 # Allow the player time to issue playlist requests.
-                # Wait time grows with each retry to handle slow servers.
                 player_wait = _BASE_PLAYER_WAIT + (_PLAYER_WAIT_INCREMENT * attempt)
                 await asyncio.sleep(player_wait)
                 await page.close()
@@ -293,7 +219,7 @@ class Scraper:
                 if self._media_found:
                     return metadata
 
-                # No video stream detected; remove any temp directory.
+                # No video stream detected — clean up the temp directory.
                 if metadata.dir:
                     shutil.rmtree(metadata.dir)
 

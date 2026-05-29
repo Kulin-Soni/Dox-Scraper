@@ -5,3 +5,4 @@ def config_logger():
         level=logging.INFO,
         format="[%(asctime)s - %(levelname)s] %(name)s: %(message)s",
     )
+    logging.getLogger("telethon.network.mtprotosender").setLevel(logging.CRITICAL)

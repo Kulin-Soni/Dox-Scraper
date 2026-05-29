@@ -1,17 +1,33 @@
+"""
+scrapers/miruro.py
+==================
+Scraper implementation for the Miruro provider (miruro.bz).
+
+Provider details
+----------------
+- Episode URLs are navigated to directly (no local proxy required).
+- Language preference is injected into ``localStorage`` before each page
+  load so the player selects the correct sub/dub stream automatically.
+- Because Miruro falls back to sub when dub is unavailable, the scraper
+  verifies the active language via ``localStorage`` after navigation and
+  returns ``None`` on a mismatch rather than silently saving the wrong track.
+- Subtitle filenames are suffixed with a 10-character random token to avoid
+  collisions when the same VTT segment is delivered across multiple responses.
+"""
+
 import asyncio
-import logging
 import shutil
 import traceback
-from pathlib import Path
+from secrets import choice
+from string import ascii_letters
 from urllib.parse import quote
 
-import aiofiles
 import aiohttp
 from camoufox.async_api import BrowserContext  # type: ignore
 from pathvalidate import sanitize_filename
-from playwright.async_api import ElementHandle, Page
-from tqdm.asyncio import tqdm
+from playwright.async_api import Page
 
+from scraper.base import BaseScraper, _BASE_PLAYER_WAIT, _MAX_ATTEMPTS, _PLAYER_WAIT_INCREMENT
 from shared.models import Metadata
 
 # ---------------------------------------------------------------------------
@@ -19,35 +35,23 @@ from shared.models import Metadata
 # ---------------------------------------------------------------------------
 
 CONTENT_TYPES: list[str] = ["sub", "dub"]
+
 PROVIDER_ORIGIN: str = "https://miruro.bz"
 PROVIDER: str = f"{PROVIDER_ORIGIN}/watch/"
 
-# Maximum concurrent TS chunk downloads per scrape session.
-_MAX_CONCURRENT_DOWNLOADS = 75
-
-# Maximum page-load attempts before giving up on a single target.
-_MAX_ATTEMPTS = 20
-
-# Base wait time (seconds) before declaring the player has fired its requests.
-# Each retry adds an extra 0.5 s to allow slower servers more time.
-_BASE_PLAYER_WAIT = 5.0
-_PLAYER_WAIT_INCREMENT = 0.5
+MIRURO_PLAYER_WAIT = 5
 
 
 # ---------------------------------------------------------------------------
-# URL Builder
+# URL builder
 # ---------------------------------------------------------------------------
 
 
 class URLBuilder:
-    """Builds a flat list of per-anime episode stream entries."""
+    """Builds a flat list of per-anime episode stream entries for Miruro."""
 
     def __init__(self, anime_list: list[dict] | None = None) -> None:
         self.anime_list: list[dict] = anime_list if anime_list is not None else []
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def build_episode_entry(
         self,
@@ -57,10 +61,29 @@ class URLBuilder:
         url: str | None = None,
     ) -> dict[str, str | int]:
         """
-        Construct a single episode entry.
+        Construct a single episode entry dict.
 
-        If ``url`` is provided it is used as-is; otherwise it is built from
-        the provider base URL + anime id + episode + content type.
+        If ``url`` is provided it is used as-is; otherwise the URL is built
+        from the provider base URL, AniList id, romanised title, and episode
+        number as a query parameter.
+
+        Parameters
+        ----------
+        anime:
+            Anime dict containing at least ``"id"``, ``"title.english"``,
+            ``"title.romaji"``, and ``"episodes"``.
+        episode:
+            Episode number, or ``""`` / ``0`` for a standalone (non-episodic) entry.
+        content_type:
+            ``"sub"`` or ``"dub"``.
+        url:
+            Optional override URL. When omitted the URL is constructed automatically.
+
+        Returns
+        -------
+        dict
+            Entry dict compatible with ``BaseScraper.scrape()``, including the
+            ``"anilist_id"`` key required for localStorage language injection.
         """
         anime_id = anime["id"]
         sanitized_title = sanitize_filename(anime["title"]["english"]).replace(" ", "_")
@@ -74,16 +97,23 @@ class URLBuilder:
 
         return {
             "name": name,
-            "url": url or f"{PROVIDER}/{anime["id"]}/{quote(anime["title"]["romaji"])}?ep={episode}",
+            "url": url or f"{PROVIDER}/{anime['id']}/{quote(anime['title']['romaji'])}?ep={episode}",
             "episode": episode,
             "content_type": content_type,
             "provider": "miruro",
+            "anilist_id": anime["id"],
         }
 
     def build(self) -> list[list[dict]]:
         """
         Generate all sub/dub episode entries grouped by anime.
-        Skips anime whose episode count is falsy (None, 0, empty string).
+        Anime with a falsy episode count (``None``, ``0``, ``""``) are skipped.
+
+        Returns
+        -------
+        list[list[dict]]
+            Outer list: one element per anime.
+            Inner list: one entry per (episode × content_type) combination.
         """
         entries: list[list[dict]] = []
 
@@ -101,162 +131,80 @@ class URLBuilder:
         return entries
 
 
-class Scraper:
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
+
+
+class Scraper(BaseScraper):
     """
-    Intercepts HLS (.m3u8) streams and subtitle (.vtt) files loaded by a
-    Camoufox browser page, downloads all TS chunks in parallel, and records
-    metadata about the resulting files for downstream processing.
+    Miruro-specific scraper.
+
+    Injects localStorage settings before each page load so the player
+    auto-selects the correct language track, then delegates interception
+    and chunk downloading to the base class.
     """
 
-    def __init__(self) -> None:
-        self._chunk_urls: list[str] = []
-        self._current_title: str = ""
-        self._output_dir: Path | None = None
-        self._metadata: Metadata = Metadata()
-        self._media_found: bool = False
-        self._headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
-            "Origin": PROVIDER_ORIGIN,
-            "Referer": PROVIDER_ORIGIN,
-            "Connection": "keep-alive",
-            "Sec-GPC": "1",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "cross-site",
-        }
-        self._logger = logging.getLogger(__name__)
+    PROVIDER_ORIGIN = "https://miruro.bz"
 
     # ------------------------------------------------------------------
-    # Browser response interception
+    # Subtitle filename override
     # ------------------------------------------------------------------
 
-    async def _on_browser_response(self, response) -> None:
-        """Route every captured network response to the appropriate handler."""
-        await self._handle_m3u8_or_vtt(response)
+    def _make_subtitle_filename(self, subtitle_stem: str) -> str:
+        """
+        Append a 10-character random alphabetic token to the subtitle stem.
 
-    async def _is_invalid_url(self, frame: ElementHandle | None) -> bool:
-        if not frame:
-            return True
-        return await (await frame.content_frame()).query_selector(".error-container") is not None  # type: ignore
+        Miruro can deliver the same logical VTT segment across multiple
+        responses; the random suffix prevents later chunks from overwriting
+        earlier ones.
 
-    async def _is_content_type(self, page: Page, anilist_id: int, content_type: str):
+        Parameters
+        ----------
+        subtitle_stem:
+            The cleaned filename stem extracted from the response URL.
+
+        Returns
+        -------
+        str
+            A uniquified ``.vtt`` filename.
+        """
+        token = "".join(choice(ascii_letters) for _ in range(10))
+        return f"{subtitle_stem}_{token}.vtt"
+
+    # ------------------------------------------------------------------
+    # Provider-specific helpers
+    # ------------------------------------------------------------------
+
+    async def _is_content_type(
+        self, page: Page, anilist_id: int, content_type: str
+    ) -> bool:
+        """
+        Verify that the player's active language matches ``content_type``.
+
+        Reads ``miruro:anime:language:<anilist_id>`` from the page's
+        localStorage and compares it (case-insensitively) to the expected
+        value.  Returns ``False`` if the key is absent or mismatched.
+
+        Parameters
+        ----------
+        page:
+            The Playwright ``Page`` object after navigation.
+        anilist_id:
+            AniList numeric id used as part of the localStorage key.
+        content_type:
+            The expected language string (e.g. ``"ssub"`` or ``"dub"``).
+        """
         eval_content_type: str | None = await page.evaluate(
             f"localStorage.getItem('miruro:anime:language:{anilist_id}')"
         )
-        return eval_content_type and eval_content_type.lower() == f'"{content_type}"'
-
-    async def _handle_m3u8_or_vtt(self, response) -> None:
-        """
-        Parse HLS media playlist responses to collect TS chunk URLs,
-        or persist subtitle (VTT) responses to disk.
-
-        Only media playlists (those containing ``#EXTINF`` tags) are
-        processed; master playlists that list quality levels are ignored.
-        """
-        url = str(response.url)
-        print(response)
-        try:
-            if url.endswith(".m3u8"):
-                content = await response.text()
-                if "#EXTINF" in content:
-                    for line in content.splitlines():
-                        if line.startswith("https://"):
-                            self._chunk_urls.append(line)
-
-            elif url.endswith(".vtt"):
-                content = await response.text()
-                # Derive a clean filename from the last URL path segment,
-                # stripping the extension before appending .vtt.
-                raw_segment = url.rsplit("/", maxsplit=1)[-1]
-                subtitle_stem = "_".join(raw_segment.split(".")[:-1])
-                subtitle_filename = f"{subtitle_stem}.vtt"
-                await self._save_subtitle(content, subtitle_filename)
-        except Exception:
-            pass
+        return bool(
+            eval_content_type
+            and eval_content_type.lower() == f'"{content_type}"'
+        )
 
     # ------------------------------------------------------------------
-    # Subtitle handling
-    # ------------------------------------------------------------------
-
-    def _ensure_output_dir(self) -> None:
-        """Create the per-title temp directory if it does not exist yet."""
-        if self._output_dir is None:
-            self._output_dir = Path("./temp") / self._current_title
-            self._output_dir.mkdir(exist_ok=True, parents=True)
-            self._metadata.dir = self._output_dir.as_posix()
-
-    async def _save_subtitle(self, content: str, filename: str) -> None:
-        """
-        Append subtitle content to a VTT file inside the output directory.
-
-        Appending (rather than overwriting) handles cases where a single
-        subtitle file is streamed in multiple response chunks.
-        """
-        self._ensure_output_dir()
-        subtitle_path = self._output_dir / f"{self._current_title}_{filename}.vtt"
-
-        async with aiofiles.open(subtitle_path.resolve(), "a") as f:
-            await f.write(content)
-
-        self._metadata.subtitles.append(subtitle_path.as_posix())
-
-    # ------------------------------------------------------------------
-    # Chunk download and merge
-    # ------------------------------------------------------------------
-
-    async def _download_chunks(self, session: aiohttp.ClientSession) -> None:
-        """
-        Download all collected TS chunk URLs concurrently and write each to a
-        numbered temp file (``temp_0.ts``, ``temp_1.ts``, …).
-
-        A semaphore caps concurrency at ``_MAX_CONCURRENT_DOWNLOADS`` to avoid
-        overwhelming the CDN. Failed chunks are logged but do not abort the
-        overall download.
-        """
-        if not self._chunk_urls:
-            return
-
-        self._ensure_output_dir()
-        self._media_found = True
-
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
-
-        async def download_chunk(url: str, index: int, progress_bar: tqdm) -> None:
-            temp_path = self._output_dir / f"temp_{index}.ts"
-            for _ in range(_MAX_ATTEMPTS):
-                try:
-                    async with semaphore:
-                        async with aiofiles.open(temp_path, "w+b") as f:
-                            response = await session.get(url, headers=self._headers)
-                            data = await response.read()
-                            await f.write(data)
-                            await f.flush()
-
-                    progress_bar.update(1)
-                    break
-                except Exception:
-                    self._logger.error("[chunk %s] Download failed:", index)
-                    print(traceback.format_exc())
-
-        with tqdm(
-            total=len(self._chunk_urls), unit="chunks", desc="Downloading"
-        ) as bar:
-            await asyncio.gather(
-                *(
-                    asyncio.create_task(download_chunk(url, i, bar))
-                    for i, url in enumerate(self._chunk_urls)
-                )
-            )
-
-        output_path = self._output_dir / f"{self._current_title}.mkv"
-        self._metadata.video = output_path.as_posix()
-        self._metadata.parts = len(self._chunk_urls)
-
-    # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry point (implements BaseScraper.scrape)
     # ------------------------------------------------------------------
 
     async def scrape(
@@ -266,13 +214,36 @@ class Scraper:
         http_session: aiohttp.ClientSession,
     ) -> Metadata | None:
         """
-        Navigate to ``target["url"]`` through the local proxy server, capture
-        HLS responses, download all TS chunks, and return a Metadata object.
+        Navigate to ``target["url"]``, capture HLS responses, download all
+        TS chunks, and return a ``Metadata`` object.
 
-        Returns None if no media was detected or an unrecoverable error occurs.
+        localStorage is pre-seeded via an init script so the player boots
+        with the correct language and provider settings.  After navigation
+        the active language is verified; a mismatch (e.g. Miruro falling back
+        to sub because dub is unavailable) causes an immediate ``None`` return.
+
+        Parameters
+        ----------
+        target:
+            Entry dict from ``URLBuilder.build_episode_entry()``.
+            Must include ``"anilist_id"`` and ``"content_type"``.
+        browser_ctx:
+            Live Camoufox ``BrowserContext``.
+        http_session:
+            Live ``aiohttp.ClientSession`` for chunk downloads.
+
+        Returns
+        -------
+        Metadata
+            Populated on success.
+        None
+            If content type mismatches, no media was found, or an error occurred.
         """
         metadata = Metadata()
         self._current_title = target["name"]
+
+        # Miruro uses "ssub" internally for soft-subtitled content.
+        content_type = "ssub" if target["content_type"] == "sub" else "dub"
 
         for attempt in range(_MAX_ATTEMPTS):
             try:
@@ -280,8 +251,19 @@ class Scraper:
                     f"""
                         raw = localStorage.getItem('miruro:settings:user');
                         settings = raw ? JSON.parse(raw) : {{}};
-                        localStorage.setItem('miruro:anime:language:{target["anilist_id"]}', '"{target["content_type"]}"');
-                        localStorage.setItem('miruro:settings:user', JSON.stringify({{...settings, autoPlay: true, defaultProvider: 'bee', langDefault: '{target["content_type"]}'}}));
+                        localStorage.setItem(
+                            'miruro:anime:language:{target["anilist_id"]}',
+                            '"{content_type}"'
+                        );
+                        localStorage.setItem(
+                            'miruro:settings:user',
+                            JSON.stringify({{
+                                ...settings,
+                                autoPlay: true,
+                                defaultProvider: 'bee',
+                                langDefault: '{target["content_type"]}'
+                            }})
+                        );
                     """
                 )
 
@@ -292,15 +274,14 @@ class Scraper:
                 await page.wait_for_load_state("domcontentloaded")
 
                 if not await self._is_content_type(
-                    page, target["anilist_id"], target["content_type"]
+                    page, target["anilist_id"], content_type
                 ):
-                    # This is to catch if its really the correct type getting fetched, because Miruro often fallbacks on sub if dub is not available.
+                # Miruro falls back to sub if the asked content type is not available.
                     print("Not matching type")
                     return None
 
                 # Allow the player time to issue playlist requests.
-                # Wait time grows with each retry to handle slow servers.
-                player_wait = _BASE_PLAYER_WAIT + (_PLAYER_WAIT_INCREMENT * attempt)
+                player_wait = _BASE_PLAYER_WAIT + MIRURO_PLAYER_WAIT + (_PLAYER_WAIT_INCREMENT * attempt)
                 await asyncio.sleep(player_wait)
                 await page.close()
 
@@ -310,7 +291,7 @@ class Scraper:
                 if self._media_found:
                     return metadata
 
-                # No video stream detected; remove any temp directory.
+                # No video stream detected — clean up the temp directory.
                 if metadata.dir:
                     shutil.rmtree(metadata.dir)
 

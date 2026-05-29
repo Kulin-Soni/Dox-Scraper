@@ -146,7 +146,8 @@ async def _scrape_convert_and_upload(
 
     Returns True on complete success, False on any stage failure.
     """
-    metadata = await scraper_cls.scrape(entry, browser_ctx, session)
+    scraper = scraper_cls()
+    metadata = await scraper.scrape(entry, browser_ctx, session)
     if not metadata:
         logger.info("Scrape returned no metadata for entry: %s", entry.get("name"))
         return False
@@ -235,9 +236,14 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
                 total_anime,
             )
 
-            success = await _scrape_convert_and_upload(
-                entry, ctx, session, anime, anime_doc, Scraper
-            )
+            # Skip if this episode was already successfully scraped
+            if entry["episode_id"] in anime_doc.scraped(entry["content_type"]):
+                success = True
+            else:
+                success = await _scrape_convert_and_upload(
+                    entry, ctx, session, anime, anime_doc, Scraper
+                )
+
             tracker.save(
                 page,
                 _compute_remaining_track(anime_list, i, entry_index + j + 1),

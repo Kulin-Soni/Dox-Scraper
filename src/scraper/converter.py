@@ -137,3 +137,4 @@ async def convert(metadata: Metadata) -> Metadata | None:
     except subprocess.CalledProcessError as e:
         print(e.stderr)
         print(traceback.format_exc())
+        return None

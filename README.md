@@ -8,7 +8,7 @@ A multi-connection anime scraping pipeline along with telegram client to store t
 - Reliable providers support
 - MongoDB indexing of files
 
-## Planned Features
+## Upcoming Features
 
 - More providers support
 - Anime searching and fetching in Telegram
