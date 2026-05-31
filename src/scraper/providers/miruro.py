@@ -203,6 +203,9 @@ class Scraper(BaseScraper):
             and eval_content_type.lower() == f'"{content_type}"'
         )
 
+    async def _is_correct_episode(self, page: Page, episode_no: int):
+        return page.url.endswith(f"?ep={episode_no}")
+
     # ------------------------------------------------------------------
     # Public entry point (implements BaseScraper.scrape)
     # ------------------------------------------------------------------
@@ -249,8 +252,13 @@ class Scraper(BaseScraper):
             try:
                 await browser_ctx.add_init_script(
                     f"""
-                        raw = localStorage.getItem('miruro:settings:user');
-                        settings = raw ? JSON.parse(raw) : {{}};
+                        let raw = localStorage.getItem('miruro:settings:user');
+                        const settings = raw ? JSON.parse(raw) : {{}};
+
+                        let raw = localStorage.getItem('vds-player');
+                        const player = raw ? JSON.parse(raw) : {{}};
+
+
                         localStorage.setItem(
                             'miruro:anime:language:{target["anilist_id"]}',
                             '"{content_type}"'
@@ -264,6 +272,14 @@ class Scraper(BaseScraper):
                                 langDefault: '{target["content_type"]}'
                             }})
                         );
+
+                        localStorage.setItem(
+                        'vds-player',
+                        JSON.stringify({{
+                            ...player,
+                            captions: true
+                        }})
+                        )
                     """
                 )
 
@@ -273,9 +289,9 @@ class Scraper(BaseScraper):
                 await page.goto(target["url"])
                 await page.wait_for_load_state("domcontentloaded")
 
-                if not await self._is_content_type(
+                if not (await self._is_content_type(
                     page, target["anilist_id"], content_type
-                ):
+                ) and await self._is_correct_episode(page, target["episode"])):
                 # Miruro falls back to sub if the asked content type is not available.
                     print("Not matching type")
                     return None

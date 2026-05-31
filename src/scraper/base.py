@@ -17,6 +17,7 @@ Shared responsibilities handled here:
 
 import asyncio
 import logging
+import re
 import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -117,6 +118,11 @@ class BaseScraper(ABC):
         """
         await self._handle_m3u8_or_vtt(response)
 
+    def _is_subtitle_vtt(self, content: str) -> bool:
+        cues = re.findall(r'-->\s*.+\n(.+)', content)
+        url_count = sum(1 for c in cues if re.match(r'https?://', c))
+        return bool(cues) and (url_count / len(cues)) < 0.5
+
     async def _handle_m3u8_or_vtt(self, response) -> None:
         """
         Inspect a browser response and act on recognised media types.
@@ -133,13 +139,16 @@ class BaseScraper(ABC):
         try:
             if url.endswith(".m3u8"):
                 content = await response.text()
-                if "#EXTINF" in content:
-                    for line in content.splitlines():
-                        if line.startswith("https://"):
-                            self._chunk_urls.append(line)
+                if not "#EXTINF" in content:
+                    return
+                for line in content.splitlines():
+                    if line.startswith("https://"):
+                        self._chunk_urls.append(line)
 
             elif url.endswith(".vtt"):
                 content = await response.text()
+                if not self._is_subtitle_vtt(content):
+                    return
                 # Derive a stem from the last URL path segment, dropping its extension.
                 raw_segment = url.rsplit("/", maxsplit=1)[-1]
                 subtitle_stem = "_".join(raw_segment.split(".")[:-1])
@@ -255,8 +264,9 @@ class BaseScraper(ABC):
                     break
 
                 except Exception:
-                    self._logger.error("[chunk %s] Download failed:", index)
-                    print(traceback.format_exc())
+                    pass
+                    # self._logger.error("[chunk %s] Download failed:", index)
+                    # print(traceback.format_exc())
 
         with tqdm(total=len(self._chunk_urls), unit="chunks", desc="Downloading") as bar:
             await asyncio.gather(
