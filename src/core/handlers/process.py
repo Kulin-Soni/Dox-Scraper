@@ -32,7 +32,7 @@ class AppContext:
         self._manager = Manager()
 
         # Inter-process communication queues, and pipes (manager-backed, safe across PIDs).
-        self.cmd_q  = self._manager.Queue()  # commands â main process
+        self.cmd_q  = self._manager.Queue()  # commands -> main process
         self.scraper_conn, self.uploader_conn = Pipe() # duplex for scraper and uploader to contact
         self.scrape_q = self._manager.Queue() # for calling scraper with payloads
 

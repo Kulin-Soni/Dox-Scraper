@@ -13,6 +13,7 @@ A multi-connection anime scraping pipeline along with telegram client to store t
 - More providers support
 - Anime searching and fetching in Telegram
 - Tests
+- **A fully fledged version which scrapes from RSS feeds, alongside a UI.**
 
 ## Requirements
 
