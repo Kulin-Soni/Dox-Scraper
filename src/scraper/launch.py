@@ -40,6 +40,13 @@ DEFAULT_PROVIDER = "anikoto"
 
 logger = logging.getLogger(__name__)
 
+def _get_anime_name(anime_info: dict) -> str:
+    names = anime_info.get("title", {})
+    for key in ("english", "userPreferred", "romaji", "native"):
+        if name := names.get(key):
+            return name
+    return ""
+
 
 async def _load_or_generate_anime_list(
     tracker: ProgressTracker,
@@ -186,10 +193,10 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
     for i, anime in enumerate(remaining_anime):
         anime_info = anime["info"]
         is_airing = anime_info.get("status") == "RELEASING"
-
+        print(anime)
         anime_doc = await ScrapedAnime.get_or_create(
             anilist_id=anime_info["id"],
-            title=anime_info["title"].get("english", ""),
+            title=_get_anime_name(anime_info),
             is_airing=is_airing,
             anime_info=anime_info,
         )
@@ -272,7 +279,7 @@ async def _single_scrape(
 
     anime_doc = await ScrapedAnime.get_or_create(
         anilist_id=request.anilist_id,
-        title=anime_info["title"].get("english", ""),
+        title=_get_anime_name(anime_info),
         is_airing=is_airing,
         anime_info=anime_info,
     )
@@ -332,7 +339,7 @@ async def _anime_scrape(
 
     anime_doc = await ScrapedAnime.get_or_create(
         anilist_id=request.anilist_id,
-        title=anime_info["title"].get("english", ""),
+        title=_get_anime_name(anime_info),
         is_airing=is_airing,
         anime_info=anime_info,
     )
@@ -402,15 +409,18 @@ async def scrape_job() -> None:
         ctx = await browser.new_context()  # type: ignore
 
         while True:
-            if app_ctx.scrape_q.empty():
-                await asyncio.sleep(1)
-                continue
+            try:
+                if app_ctx.scrape_q.empty():
+                    await asyncio.sleep(1)
+                    continue
 
-            item: ScrapingRequests = app_ctx.scrape_q.get_nowait()
+                item: ScrapingRequests = app_ctx.scrape_q.get_nowait()
 
-            if item.mode == "auto":
-                await _auto_scraping(ctx, session)
-            elif item.mode == "request":
-                await _single_scrape(ctx, session, item)
-            elif item.mode == "anime":
-                await _anime_scrape(ctx, session, item)
+                if item.mode == "auto":
+                    await _auto_scraping(ctx, session)
+                elif item.mode == "request":
+                    await _single_scrape(ctx, session, item)
+                elif item.mode == "anime":
+                    await _anime_scrape(ctx, session, item)
+            except:
+                print(traceback.format_exc())
