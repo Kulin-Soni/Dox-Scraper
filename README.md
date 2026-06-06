@@ -70,11 +70,7 @@ A multi-connection anime scraping pipeline along with telegram client to store t
 
 All things have been tested on a Debian linux server and, it must work properly on all machines with ARMv8.2-A (concerns Raspberry Pi) or higher.
 
-1. You don't need to run a mongodb database externally for this, so just use the following Mongo URI in env:
-
-   ```env
-   MONGO_URI=mongodb//mongo:27017
-   ```
+1. Setup all env keys, don't forget to setup username and password for Mongodb in environment variables. Use the `.env.example` as your template.
 
 2. Run the containers:
 

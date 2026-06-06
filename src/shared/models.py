@@ -45,10 +45,48 @@ class TelegramFile(Document):
     channel_id: int
     msg_id:     int
     queries:    list[str]
+    episode_no: int
+    content_type: str
     anilist_id: int
 
     class Settings:
         name = "telegram_files"
+    
+    @classmethod
+    async def find(
+        cls,
+        episode_no: int,
+        content_type: str,
+        anilist_id: int,
+        *_
+    ) -> "TelegramFile | None":         # None = couldn't resolve episode count
+
+        doc = await cls.find_one(cls.anilist_id == anilist_id, cls.episode_no == episode_no, cls.content_type == content_type)
+        if doc:
+            return doc
+    
+    @classmethod
+    async def new(
+        cls,
+        channel_id: int,
+        msg_id: int,
+        queries: list[str],
+        episode_no: int,
+        content_type: str,
+        anilist_id: int
+    ) -> "TelegramFile":
+        
+        doc = cls(
+            channel_id=channel_id,
+            msg_id=msg_id,
+            queries=queries,
+            episode_no=episode_no,
+            content_type=content_type,
+            anilist_id=anilist_id
+        )
+        await doc.insert()
+        return doc
+
 
 
 class ScrapedAnime(Document):

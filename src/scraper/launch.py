@@ -133,6 +133,8 @@ async def _scrape_convert_and_upload(
     entry: dict,
     browser_ctx: BrowserContext,
     session: aiohttp.ClientSession,
+    episode_no: int,
+    content_type: str,
     anilist_info: dict,
     anime_doc: ScrapedAnime,
     scraper_cls,
@@ -165,12 +167,14 @@ async def _scrape_convert_and_upload(
         return False
 
     try:
-        await TelegramFile(
+        await TelegramFile.new(
             channel_id=channel_id,
             msg_id=msg_id,
             queries=_build_search_queries(metadata, anilist_info),
-            anilist_id=anilist_info["info"]["id"],
-        ).create()
+            episode_no=episode_no,
+            content_type=content_type,
+            anilist_id=anilist_info["info"]["id"]
+        )
         await anime_doc.mark_scraped(
             episode=entry["episode"],
             content_type=entry.get("content_type", "sub"),
@@ -241,7 +245,7 @@ async def _auto_scraping(ctx: BrowserContext, session: aiohttp.ClientSession) ->
                 success = True
             else:
                 success = await _scrape_convert_and_upload(
-                    entry, ctx, session, anime, anime_doc, Scraper
+                    entry, ctx, session, entry["episode"], entry["content_type"],  anime, anime_doc, Scraper
                 )
 
             tracker.save(
@@ -302,12 +306,16 @@ async def _single_scrape(
         )
         return False
 
-    # Skip if this episode was already successfully scraped
+    # Re-attempt the episode if done already
     if request.episode in anime_doc.scraped(request.content_type):
-        return True
+        content_type = "sub" if request.content_type == "sub" else "dub"
+        anime_doc.scraped(request.content_type).remove(request.episode)
+        telegram_doc = await TelegramFile.find(episode_no=request.episode, content_type=content_type, anilist_id=request.anilist_id)
+        if telegram_doc:
+            await telegram_doc.delete()
 
     ok = await _scrape_convert_and_upload(
-        entry, ctx, session, {"info": anime_info}, anime_doc, Scraper
+        entry, ctx, session, request.episode, request.content_type, {"info": anime_info}, anime_doc, Scraper
     )
     if not ok:
         await anime_doc.mark_failed(int(entry["episode"]), str(entry["content_type"]))
@@ -383,7 +391,7 @@ async def _anime_scrape(
         logger.info("Anime scraping: (%s/%s)", i + 1, total_entries)
 
         ok = await _scrape_convert_and_upload(
-            entry, ctx, session, {"info": anime_info}, anime_doc, Scraper
+            entry, ctx, session, entry["episode"], entry["content_type"], {"info": anime_info}, anime_doc, Scraper
         )
         if not ok:
             await anime_doc.mark_failed(
